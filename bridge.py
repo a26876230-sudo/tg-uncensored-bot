@@ -115,8 +115,10 @@ class Bridge:
             if not transcript:
                 await message.reply_text("❌ В голосовом сообщении не удалось разобрать речь.")
                 return
-            payload.update(kind="voice", text=transcript)
-            for chunk in split_text(f"🎙 {transcript}"):
+            echo = f"🎙 {transcript}"
+            text = f"{message.caption}\n\n{echo}" if message.caption else transcript
+            payload.update(kind="voice", text=text)
+            for chunk in split_text(echo):
                 await message.reply_text(chunk)
         elif not (payload["text"] or payload.get("attachments")):
             return

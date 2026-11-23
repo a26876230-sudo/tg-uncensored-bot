@@ -53,10 +53,11 @@ def test_groups_are_ignored_even_for_owner():
     ("field", "file_name"),
     [("voice", "voice.ogg"), ("audio", "recording.wav"), ("video_note", "video.mp4")],
 )
-def test_transcribes_and_echoes_before_forwarding(field, file_name):
+@pytest.mark.parametrize("caption", [None, "Это обновление приложения"])
+def test_transcribes_and_echoes_before_forwarding(field, file_name, caption):
     file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(b"audio")))
     media = SimpleNamespace(get_file=AsyncMock(return_value=file), file_name="recording.wav")
-    message = make_message(222, **{field: media})
+    message = make_message(222, caption=caption, **{field: media})
     create = AsyncMock(return_value=SimpleNamespace(text="  Собери APK  "))
     groq = SimpleNamespace(audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create)))
 
@@ -66,7 +67,8 @@ def test_transcribes_and_echoes_before_forwarding(field, file_name):
         assert request.headers["X-Webhook-Secret"] == "fake-secret"
         assert json.loads(request.content) == {
             "source": "telegram", "kind": "voice", "chat_id": 222,
-            "message_id": 42, "from": "owner", "text": "Собери APK",
+            "message_id": 42, "from": "owner",
+            "text": "Это обновление приложения\n\n🎙 Собери APK" if caption else "Собери APK",
         }
         return httpx.Response(204)
 
