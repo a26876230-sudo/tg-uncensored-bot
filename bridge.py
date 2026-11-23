@@ -145,7 +145,7 @@ def build_application(config: Config) -> Application:
     application = Application.builder().token(config.token).post_shutdown(shutdown).build()
     application.add_handler(CommandHandler("start", bridge.start, filters.UpdateType.MESSAGE))
     application.add_handler(CommandHandler("id", bridge.show_id, filters.UpdateType.MESSAGE))
-    application.add_handler(MessageHandler(filters.UpdateType.MESSAGE & ~filters.COMMAND, bridge.handle_message))
+    application.add_handler(MessageHandler(filters.UpdateType.MESSAGE, bridge.handle_message))
     application.add_error_handler(log_error)
     return application
 

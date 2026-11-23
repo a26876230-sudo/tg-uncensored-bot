@@ -93,7 +93,16 @@ def test_document_metadata_and_failed_webhook():
     message.reply_text.assert_awaited_once_with("❌ Не удалось передать задачу в Software Factory.")
 
 
-def test_application_dispatches_text_to_local_webhook(monkeypatch):
+@pytest.mark.parametrize(
+    ("text", "reply", "forwarded"),
+    [
+        ("Собери APK", "✅ Передал задачу", True),
+        ("/health check APK", "✅ Передал задачу", True),
+        ("/id", "Ваш Telegram ID: 111", False),
+        ("/start", "Отправьте текст или голосовое сообщение — передам задачу в Software Factory.", False),
+    ],
+)
+def test_application_dispatches_text_to_local_webhook(monkeypatch, text, reply, forwarded):
     received = []
     telegram_calls = []
 
@@ -137,7 +146,14 @@ def test_application_dispatches_text_to_local_webhook(monkeypatch):
                     await application.start()
                     try:
                         update = Update.de_json({
-                            "update_id": 1, "message": {**message, "text": "Собери APK"},
+                            "update_id": 1,
+                            "message": {
+                                **message,
+                                "text": text,
+                                "entities": [
+                                    {"type": "bot_command", "offset": 0, "length": len(text.split()[0])}
+                                ] if text.startswith("/") else [],
+                            },
                         }, application.bot)
                         await application.process_update(update)
                     finally:
@@ -151,10 +167,11 @@ def test_application_dispatches_text_to_local_webhook(monkeypatch):
             server.shutdown()
             thread.join()
 
-    assert received == [("/hook", "fake-secret", {
+    expected = [("/hook", "fake-secret", {
         "source": "telegram", "kind": "text", "chat_id": 111,
-        "message_id": 42, "from": "owner", "text": "Собери APK",
+        "message_id": 42, "from": "owner", "text": text,
     })]
+    assert received == (expected if forwarded else [])
     assert [(call["chat_id"], call["text"]) for call in telegram_calls] == [
-        (111, "✅ Передал задачу"),
+        (111, reply),
     ]
