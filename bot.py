@@ -3,8 +3,10 @@ import json
 import logging
 import os
 import re
+import sqlite3
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
@@ -19,6 +21,7 @@ LOG = logging.getLogger(__name__)
 UNLEASHED_BASE_URL = "https://api.unleashedapi.com/v1/"
 DEFAULT_MODEL = "deepseek-v4.1-flash-abliterated"
 DEFAULT_BOT_NAME = "Нори"
+DEFAULT_DB_PATH = Path(".nori/chat-memory.sqlite3")
 NORI_COMMAND = re.compile(r"^/nori(?:@([a-z0-9_]+))?(?=\s|$)\s*(.*)$", re.IGNORECASE | re.DOTALL)
 HISTORY_MESSAGES = 50
 SUMMARY_BATCH = 15
@@ -62,6 +65,7 @@ class Config:
     search_enabled: bool = True
     keenable_key: str = ""
     name: str = DEFAULT_BOT_NAME
+    db_path: Path = DEFAULT_DB_PATH
 
     @classmethod
     def from_env(cls):
@@ -79,7 +83,8 @@ class Config:
         }
         keenable_key = os.environ.get("KEENABLE_API_KEY", "").strip()
         name = os.environ.get("CHAT_BOT_NAME", "").strip() or DEFAULT_BOT_NAME
-        return cls(token, api_key, model, search_enabled, keenable_key, name)
+        db_path = Path(os.environ.get("CHAT_BOT_DB", "").strip() or DEFAULT_DB_PATH).expanduser()
+        return cls(token, api_key, model, search_enabled, keenable_key, name, db_path)
 
 
 @dataclass
@@ -88,11 +93,42 @@ class ChatMemory:
     summary: str = ""
 
 
+class MemoryStore:
+    def __init__(self, path: Path):
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.touch(mode=0o600, exist_ok=True)
+        self.db = sqlite3.connect(path)
+        with self.db:
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS chat_memory (
+                    chat_id INTEGER PRIMARY KEY, recent TEXT NOT NULL, summary TEXT NOT NULL
+                )
+            """)
+
+    def load(self) -> dict[int, ChatMemory]:
+        return {
+            chat_id: ChatMemory(deque(json.loads(recent)), summary)
+            for chat_id, recent, summary in self.db.execute("SELECT chat_id, recent, summary FROM chat_memory")
+        }
+
+    def save(self, chat_id: int, memory: ChatMemory):
+        with self.db:
+            self.db.execute("""
+                INSERT INTO chat_memory (chat_id, recent, summary) VALUES (?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET recent = excluded.recent, summary = excluded.summary
+            """, (chat_id, json.dumps(list(memory.recent), ensure_ascii=False), memory.summary))
+
+    def close(self):
+        self.db.close()
+
+
 class ChatBot:
     def __init__(self, config: Config, http: httpx.AsyncClient):
         self.config = config
         self.http = http
         self.name_pattern = re.compile(rf"(?<!\w){re.escape(config.name.casefold())}(?!\w)")
+        self.store = MemoryStore(config.db_path)
+        self.memories = self.store.load()
 
     async def search(self, query: str) -> list[dict[str, str]]:
         if not self.config.search_enabled:
@@ -161,11 +197,14 @@ class ChatBot:
             })
         return await self.request_completion([*messages, *memory.recent, latest])
 
-    async def remember(self, memory: ChatMemory, *messages: dict[str, str]):
+    async def remember(self, chat_id: int, memory: ChatMemory, *messages: dict[str, str]):
         memory.recent.extend(messages)
-        if len(memory.recent) <= HISTORY_MESSAGES:
+        oldest = []
+        if len(memory.recent) > HISTORY_MESSAGES:
+            oldest = [memory.recent.popleft() for _ in range(SUMMARY_BATCH)]
+        self.store.save(chat_id, memory)
+        if not oldest:
             return
-        oldest = [memory.recent.popleft() for _ in range(SUMMARY_BATCH)]
         try:
             async with asyncio.timeout(SUMMARY_TIMEOUT):
                 summary = await self.request_completion([
@@ -177,6 +216,8 @@ class ChatBot:
             memory.summary = summary[:2000]
         except (TimeoutError, httpx.HTTPError, ValueError) as exc:
             LOG.warning("Не удалось обновить пересказ разговора: %s", type(exc).__name__)
+        else:
+            self.store.save(chat_id, memory)
 
     def addressed_query(self, message: Message, text: str, bot_id: int, username: str) -> str | None:
         command = NORI_COMMAND.fullmatch(text)
@@ -212,17 +253,18 @@ class ChatBot:
         if query is None and not text.strip():
             return
 
-        memory = context.chat_data.setdefault("memory", ChatMemory())
+        chat_id = message.chat.id
+        memory = self.memories.setdefault(chat_id, ChatMemory())
         sender = message.sender_chat.title if message.sender_chat else None
         if not sender:
             sender = message.from_user.full_name if message.from_user else "Участник"
         original = {"role": "user", "content": f"{sender}: {text}" if group else text}
         if query is None:
-            await self.remember(memory, original)
+            await self.remember(chat_id, memory, original)
             return
         if not query:
             if group and text.strip():
-                await self.remember(memory, original)
+                await self.remember(chat_id, memory, original)
             await message.reply_text("Напишите сообщение текстом.")
             return
         content = f"{sender}: {query}" if group else query
@@ -251,7 +293,7 @@ class ChatBot:
             saved = [original, {"role": "assistant", "content": answer}]
         finally:
             if saved:
-                await self.remember(memory, *saved)
+                await self.remember(chat_id, memory, *saved)
 
 
 def build_application(config: Config, transport: httpx.AsyncBaseTransport | None = None) -> Application:
@@ -259,6 +301,7 @@ def build_application(config: Config, transport: httpx.AsyncBaseTransport | None
     chatbot = ChatBot(config, http)
 
     async def shutdown(application: Application):
+        chatbot.store.close()
         await http.aclose()
 
     async def log_error(update: object, context: ContextTypes.DEFAULT_TYPE):

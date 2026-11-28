@@ -21,7 +21,7 @@ def make_message(text, chat_id=456, chat_type="private", **fields):
 
 
 @pytest.fixture
-def dispatch(monkeypatch):
+def dispatch(monkeypatch, tmp_path):
     sent = []
 
     async def telegram_api(self, url, method, request_data=None, **kwargs):
@@ -39,8 +39,10 @@ def dispatch(monkeypatch):
     monkeypatch.setattr(HTTPXRequest, "do_request", telegram_api)
 
     def run(model_api, messages, model=DEFAULT_MODEL, *, search_enabled=False, keenable_key="", name=DEFAULT_BOT_NAME):
+        sent.clear()
+
         async def process():
-            config = Config("123:fake", "ulk-fake", model, search_enabled, keenable_key, name)
+            config = Config("123:fake", "ulk-fake", model, search_enabled, keenable_key, name, tmp_path / "chat.sqlite3")
             application = build_application(config, httpx.MockTransport(model_api))
             async with application:
                 for index, message in enumerate(messages):
@@ -64,6 +66,7 @@ def test_config_uses_only_chat_token_and_allows_model_override(monkeypatch):
     monkeypatch.delenv("KEENABLE_SEARCH_ENABLED", raising=False)
     monkeypatch.delenv("KEENABLE_API_KEY", raising=False)
     monkeypatch.delenv("CHAT_BOT_NAME", raising=False)
+    monkeypatch.delenv("CHAT_BOT_DB", raising=False)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:bridge")
     monkeypatch.setenv("UNLEASHED_API_KEY", "ulk-fake")
     with pytest.raises(ValueError, match="CHAT_BOT_TOKEN"):
@@ -231,6 +234,32 @@ def test_group_memory_summarizes_in_batches_without_losing_recent_text(dispatch,
             "previous_summary": "" if index == 0 else "пересказ 1",
             "messages": [{"role": "user", "content": f"Owner: запись {i}"} for i in range(index * 15, (index + 1) * 15)],
         }
+
+
+def test_recreated_bot_loads_recent_messages_and_summary_for_the_same_chat(dispatch):
+    def summary_api(request):
+        payload = json.loads(request.content)["messages"]
+        assert payload[0]["content"] == SUMMARY_PROMPT
+        return completion("Старые записи")
+
+    messages = [make_message(f"запись {i}", -1, "group") for i in range(51)]
+    messages.append(make_message("другой разговор", -2, "group"))
+    assert dispatch(summary_api, messages) == []
+
+    prompts = []
+
+    def reply_api(request):
+        prompts.append(json.loads(request.content)["messages"])
+        return completion("помню")
+
+    assert dispatch(reply_api, [
+        make_message("Нори, вспомни", -1, "group"),
+        make_message("Нори, вспомни", -2, "group"),
+    ]) == [(-1, "помню"), (-2, "помню")]
+    assert prompts[0][1]["role"] == "system"
+    assert prompts[0][1]["content"].endswith('"Старые записи"')
+    assert prompts[0][2:-1] == [{"role": "user", "content": f"Owner: запись {i}"} for i in range(15, 51)]
+    assert prompts[1][1:-1] == [{"role": "user", "content": "Owner: другой разговор"}]
 
 
 @pytest.mark.parametrize("key", ["", "keen-fake"])
