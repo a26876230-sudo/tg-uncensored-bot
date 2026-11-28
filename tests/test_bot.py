@@ -6,7 +6,7 @@ import pytest
 from telegram import Update
 from telegram.request import HTTPXRequest
 
-from bot import DEFAULT_MODEL, SYSTEM_PROMPT, Config, build_application
+from bot import DEFAULT_MODEL, SEARCH_NOTE, SYSTEM_PROMPT, Config, build_application
 
 
 BOT = {"id": 123, "is_bot": True, "first_name": "Chat", "username": "chat_bot"}
@@ -38,9 +38,9 @@ def dispatch(monkeypatch):
 
     monkeypatch.setattr(HTTPXRequest, "do_request", telegram_api)
 
-    def run(model_api, messages, model=DEFAULT_MODEL):
+    def run(model_api, messages, model=DEFAULT_MODEL, *, search_enabled=False, keenable_key=""):
         async def process():
-            config = Config("123:fake", "ulk-fake", model)
+            config = Config("123:fake", "ulk-fake", model, search_enabled, keenable_key)
             application = build_application(config, httpx.MockTransport(model_api))
             async with application:
                 for index, message in enumerate(messages):
@@ -61,6 +61,8 @@ def completion(content):
 def test_config_uses_only_chat_token_and_allows_model_override(monkeypatch):
     monkeypatch.delenv("CHAT_BOT_TOKEN", raising=False)
     monkeypatch.delenv("UNLEASHED_MODEL", raising=False)
+    monkeypatch.delenv("KEENABLE_SEARCH_ENABLED", raising=False)
+    monkeypatch.delenv("KEENABLE_API_KEY", raising=False)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:bridge")
     monkeypatch.setenv("UNLEASHED_API_KEY", "ulk-fake")
     with pytest.raises(ValueError, match="CHAT_BOT_TOKEN"):
@@ -72,6 +74,17 @@ def test_config_uses_only_chat_token_and_allows_model_override(monkeypatch):
     assert Config.from_env() == Config("123:chat", "ulk-fake", DEFAULT_MODEL)
     monkeypatch.setenv("UNLEASHED_MODEL", "other-model")
     assert Config.from_env().model == "other-model"
+
+
+def test_search_settings_from_env(monkeypatch):
+    monkeypatch.setenv("CHAT_BOT_TOKEN", "123:chat")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:bridge")
+    monkeypatch.setenv("UNLEASHED_API_KEY", "ulk-fake")
+    monkeypatch.setenv("KEENABLE_SEARCH_ENABLED", "false")
+    monkeypatch.setenv("KEENABLE_API_KEY", " keen-fake ")
+    config = Config.from_env()
+    assert not config.search_enabled
+    assert config.keenable_key == "keen-fake"
 
 
 def test_dispatches_only_private_or_addressed_group_messages(dispatch):
@@ -141,6 +154,68 @@ def test_accepts_anonymous_admin_but_ignores_a_bot(dispatch):
     ]
     assert dispatch(model_api, messages) == [(group["id"], "ответ")]
     assert prompts == ["@chat_bot админ"]
+
+
+@pytest.mark.parametrize("key", ["", "keen-fake"])
+def test_search_sources_reach_model_but_do_not_enter_history(dispatch, key):
+    calls = []
+    source = {"title": "Источник", "url": "https://example.com/price", "snippet": "Цена биткоина"}
+    second_source = {"title": "Без выдержки", "url": "https://example.com/no-snippet"}
+
+    def api(request):
+        payload = json.loads(request.content)
+        assert request.method == "POST"
+        if request.url.host == "api.keenable.ai":
+            calls.append(("search", payload["query"]))
+            assert payload["max_results"] == 5
+            assert "Authorization" not in request.headers
+            if key:
+                assert request.url.path == "/v1/search"
+                assert request.headers["X-API-Key"] == key
+            else:
+                assert request.url.path == "/v1/search/public"
+                assert request.headers["X-Keenable-Title"] == "tg-uncensored-bot"
+                assert "X-API-Key" not in request.headers
+            return httpx.Response(200, json={"results": [source, None, second_source]})
+        assert request.url.host == "api.unleashedapi.com"
+        assert "X-API-Key" not in request.headers
+        messages = payload["messages"]
+        assert messages[0]["role"] == "system"
+        assert SEARCH_NOTE in messages[0]["content"]
+        query, sources = messages[-1]["content"].split("\n\nРезультаты веб-поиска (JSON):\n")
+        calls.append(("complete", query))
+        assert json.loads(sources) == [source, {**second_source, "snippet": ""}]
+        if query == "ещё вопрос":
+            assert messages[1:-1] == [
+                {"role": "user", "content": "курс биткоина"},
+                {"role": "assistant", "content": "ответ"},
+            ]
+        return completion("ответ")
+
+    messages = [make_message("чат", -1, "group"), make_message("курс биткоина"), make_message("ещё вопрос")]
+    assert dispatch(api, messages, search_enabled=True, keenable_key=key) == [(456, "ответ")] * 2
+    assert calls == [
+        ("search", "курс биткоина"), ("complete", "курс биткоина"),
+        ("search", "ещё вопрос"), ("complete", "ещё вопрос"),
+    ]
+
+
+@pytest.mark.parametrize("failure", [429, "timeout", "invalid JSON"])
+def test_search_failures_still_answer_without_sources(dispatch, failure):
+    def api(request):
+        if request.url.host == "api.keenable.ai":
+            if failure == "timeout":
+                raise httpx.ReadTimeout("timeout", request=request)
+            if failure == "invalid JSON":
+                return httpx.Response(200, text="not JSON")
+            return httpx.Response(failure)
+        assert json.loads(request.content)["messages"] == [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "вопрос"},
+        ]
+        return completion("ответ без поиска")
+
+    assert dispatch(api, [make_message("вопрос")], search_enabled=True) == [(456, "ответ без поиска")]
 
 
 @pytest.mark.parametrize(
