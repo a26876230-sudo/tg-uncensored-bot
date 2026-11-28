@@ -62,7 +62,7 @@ def dispatch(monkeypatch, tmp_path):
         async def process():
             config = Config("123:fake", "ulk-fake", model, search_enabled, keenable_key, name, tmp_path / "chat.sqlite3")
             model_transport = httpx.MockTransport(model_api)
-            boundary_transport = httpx.MockTransport(boundary_api or (lambda request: completion("НЕТ")))
+            boundary_transport = httpx.MockTransport(boundary_api or (lambda request: completion("НЕТ ПРОСТО")))
 
             async def route(request):
                 if request.url.host == "api.unleashedapi.com":
@@ -258,7 +258,8 @@ def test_refreshes_typing_while_waiting_for_completion(dispatch, monkeypatch):
     assert actions >= 2
 
 
-def test_boundary_checks_quote_during_search_and_saves_refused_exchange(dispatch):
+@pytest.mark.parametrize("verdict", ["ДА СЛОЖНО", "ДА", "ДА СЛОЖНО лишнее", "ДА, поясню"])
+def test_boundary_checks_quote_during_search_and_saves_refused_exchange(dispatch, verdict):
     searching = asyncio.Event()
     cancelled = asyncio.Event()
     content = "Owner: Нори, как это сделать?\n\nЦитата из сообщения, на которое отвечают:\nОпасный запрос"
@@ -281,12 +282,12 @@ def test_boundary_checks_quote_during_search_and_saves_refused_exchange(dispatch
             "model": "selected-model",
             "messages": [{"role": "system", "content": BOUNDARY_PROMPT}, {"role": "user", "content": content}],
             "reasoning_effort": "none",
-            "max_tokens": 8,
+            "max_tokens": 16,
         }
         rules = re.findall(r"^\d+\. .*", SYSTEM_PROMPT, re.MULTILINE)
         assert len(rules) == 7
         assert re.findall(r"^\d+\. .*", BOUNDARY_PROMPT, re.MULTILINE) == rules
-        return completion("ДА")
+        return completion(verdict)
 
     assert dispatch(model_api, [oldest, addressed], model="selected-model", search_enabled=True,
                     boundary_api=boundary_api) == [(-1, BOUNDARY_REFUSAL)]
@@ -315,11 +316,35 @@ def test_boundary_failure_is_logged_and_normal_reply_continues(dispatch, monkeyp
             await asyncio.Event().wait()
         if failure == "http":
             return httpx.Response(503)
-        return completion("ДА, поясню")
+        return completion("НЕ ЗНАЮ")
 
-    assert dispatch(lambda request: completion("ответ"), [make_message("вопрос")],
-                    boundary_api=boundary_api) == [(456, "ответ")]
+    def model_api(request):
+        assert json.loads(request.content)["reasoning_effort"] == "none"
+        return completion("ответ")
+
+    assert dispatch(model_api, [make_message("вопрос")], boundary_api=boundary_api) == [(456, "ответ")]
     assert f"Проверка границ недоступна: {error}" in caplog.text
+
+
+@pytest.mark.parametrize(("verdict", "effort", "budget"), [
+    ("НЕТ ПРОСТО", "none", 1200),
+    ("НЕТ | СЛОЖНО", "high", 4096),
+    ("НЕТ, СЛОЖНО.", "high", 4096),
+    ("НЕТ СЛОЖНО лишнее", "none", 1200),
+    ("НЕТ", "none", 1200),
+])
+def test_uses_reasoning_only_for_a_valid_complex_verdict(dispatch, verdict, effort, budget):
+    def model_api(request):
+        body = json.loads(request.content)
+        assert body["reasoning_effort"] == effort
+        assert body["max_tokens"] == budget
+        return httpx.Response(200, json={"choices": [{
+            "message": {"content": "ответ", "reasoning_content": "внутренний текст"},
+            "finish_reason": "stop",
+        }]})
+
+    assert dispatch(model_api, [make_message("вопрос")],
+                    boundary_api=lambda request: completion(verdict)) == [(456, "ответ")]
 
 
 def test_replies_include_quote_from_other_group_member(dispatch):
