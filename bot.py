@@ -75,9 +75,16 @@ STICKER_MOODS = {
     "love": ("❤️", "😻", "😍", "💖", "💕"),
     "celebrate": ("🎉", "🥳", "🎈", "🎂"),
 }
+FENCED_CODE = (
+    r"^ {0,3}(?P<fence>(?P<fence_char>[`~])(?P=fence_char){2,})[^\n]*\n"
+    r"[\s\S]*?(?:^ {0,3}(?P=fence)(?P=fence_char)*[ \t]*(?=\r?$)|\Z)"
+)
+REPLY_CODE = re.compile(
+    FENCED_CODE + r"|(?<!`)(?P<ticks>`+)(?!`)[\s\S]*?(?<!`)(?P=ticks)(?!`)", re.MULTILINE,
+)
 REPLY_MARKER = re.compile(
-    r"`?\[+[ \t]*(?:(next)[ \t]*|(reaction|sticker)[ \t]*(?:[:=][ \t]*([^\]\r\n]*))?)"
-    r"(\]+|(?=\r?$))`?", re.IGNORECASE | re.MULTILINE,
+    r"(?<![\w\[\\])\[+[ \t]*(?:(next)[ \t]*|(reaction|sticker)[ \t]*(?:[:=][ \t]*([^\]\r\n]*))?)"
+    r"(\]+(?!\w)|(?=\r?$))", re.IGNORECASE | re.MULTILINE,
 )
 CHATTER = {
     "", "привет", "приветик", "здравствуй", "здорово", "доброе утро", "добрый день",
@@ -255,10 +262,20 @@ def bubble_chunks(text: str):
 
 
 def parse_reply(answer: str) -> TelegramReply:
-    answer = answer.strip()
-    markers = list(REPLY_MARKER.finditer(answer))
-    first = markers[0] if len(markers) == 1 and markers[0].start() == 0 else None
-    text = REPLY_MARKER.sub(lambda match: "\n\n" if match[1] else "", answer)
+    answer = answer.rstrip()
+    markers = []
+    pieces = []
+    start = 0
+    for code in REPLY_CODE.finditer(answer):
+        prose = answer[start:code.start()]
+        markers.extend((start + match.start(), match) for match in REPLY_MARKER.finditer(prose))
+        pieces.extend((REPLY_MARKER.sub(lambda match: "\n\n" if match[1] else "", prose), code[0]))
+        start = code.end()
+    prose = answer[start:]
+    markers.extend((start + match.start(), match) for match in REPLY_MARKER.finditer(prose))
+    pieces.append(REPLY_MARKER.sub(lambda match: "\n\n" if match[1] else "", prose))
+    first = markers[0][1] if len(markers) == 1 and not answer[:markers[0][0]].strip() else None
+    text = "".join(pieces)
     bubbles = list(bubble_chunks(text))
     if len(bubbles) > MAX_BUBBLES:
         bubbles = bubbles[:MAX_BUBBLES]
