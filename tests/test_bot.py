@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import sqlite3
 
 import httpx
@@ -8,6 +9,7 @@ from telegram import Update
 from telegram.request import HTTPXRequest
 
 from bot import (
+    BOUNDARY_PROMPT, BOUNDARY_REFUSAL,
     DEFAULT_BOT_NAME, DEFAULT_MODEL, SEARCH_NOTE, SUMMARY_PROMPT, SYSTEM_PROMPT,
     ChatBot, ChatMemory, Config, build_application,
 )
@@ -51,7 +53,7 @@ def dispatch(monkeypatch, tmp_path):
 
     def run(
         model_api, messages, model=DEFAULT_MODEL, *, search_enabled=False, keenable_key="", name=DEFAULT_BOT_NAME,
-        on_typing=None,
+        on_typing=None, boundary_api=None,
     ):
         nonlocal typing_callback
         typing_callback = on_typing
@@ -59,7 +61,17 @@ def dispatch(monkeypatch, tmp_path):
 
         async def process():
             config = Config("123:fake", "ulk-fake", model, search_enabled, keenable_key, name, tmp_path / "chat.sqlite3")
-            application = build_application(config, httpx.MockTransport(model_api))
+            model_transport = httpx.MockTransport(model_api)
+            boundary_transport = httpx.MockTransport(boundary_api or (lambda request: completion("НЕТ")))
+
+            async def route(request):
+                if request.url.host == "api.unleashedapi.com":
+                    first = json.loads(request.content)["messages"][0]["content"]
+                    if first == BOUNDARY_PROMPT:
+                        return await boundary_transport.handle_async_request(request)
+                return await model_transport.handle_async_request(request)
+
+            application = build_application(config, httpx.MockTransport(route))
             async with application:
                 for index, message in enumerate(messages):
                     data = {"update_id": index, "message": message}
@@ -244,6 +256,70 @@ def test_refreshes_typing_while_waiting_for_completion(dispatch, monkeypatch):
 
     assert dispatch(model_api, [make_message("Привет!")], on_typing=on_typing) == [(456, "ответ")]
     assert actions >= 2
+
+
+def test_boundary_checks_quote_during_search_and_saves_refused_exchange(dispatch):
+    searching = asyncio.Event()
+    cancelled = asyncio.Event()
+    content = "Owner: Нори, как это сделать?\n\nЦитата из сообщения, на которое отвечают:\nОпасный запрос"
+    oldest = make_message("пассивная реплика", -1, "group")
+    quoted = make_message("Опасный запрос", -1, "group")
+    addressed = make_message("Нори, как это сделать?", -1, "group", reply_to_message=quoted)
+
+    async def model_api(request):
+        assert request.url.host == "api.keenable.ai", "Blocked requests must not reach the main model"
+        searching.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    async def boundary_api(request):
+        await asyncio.wait_for(searching.wait(), timeout=1)
+        body = json.loads(request.content)
+        assert body == {
+            "model": "selected-model",
+            "messages": [{"role": "system", "content": BOUNDARY_PROMPT}, {"role": "user", "content": content}],
+            "reasoning_effort": "none",
+            "max_tokens": 8,
+        }
+        rules = re.findall(r"^\d+\. .*", SYSTEM_PROMPT, re.MULTILINE)
+        assert len(rules) == 7
+        assert re.findall(r"^\d+\. .*", BOUNDARY_PROMPT, re.MULTILINE) == rules
+        return completion("ДА")
+
+    assert dispatch(model_api, [oldest, addressed], model="selected-model", search_enabled=True,
+                    boundary_api=boundary_api) == [(-1, BOUNDARY_REFUSAL)]
+    assert cancelled.is_set()
+
+    def next_completion(request):
+        history = json.loads(request.content)["messages"][1:-1]
+        assert history == [
+            {"role": "user", "content": "Owner: пассивная реплика"},
+            {"role": "user", "content": content},
+            {"role": "assistant", "content": BOUNDARY_REFUSAL},
+        ]
+        return completion("ответ")
+
+    assert dispatch(next_completion, [make_message("Нори, другой вопрос", -1, "group")]) == [(-1, "ответ")]
+
+
+@pytest.mark.parametrize(("failure", "error"), [("verdict", "ValueError"), ("http", "HTTPStatusError"),
+                                             ("timeout", "TimeoutError")])
+def test_boundary_failure_is_logged_and_normal_reply_continues(dispatch, monkeypatch, caplog, failure, error):
+    if failure == "timeout":
+        monkeypatch.setattr("bot.BOUNDARY_TIMEOUT", 0.01)
+
+    async def boundary_api(request):
+        if failure == "timeout":
+            await asyncio.Event().wait()
+        if failure == "http":
+            return httpx.Response(503)
+        return completion("ДА, поясню")
+
+    assert dispatch(lambda request: completion("ответ"), [make_message("вопрос")],
+                    boundary_api=boundary_api) == [(456, "ответ")]
+    assert f"Проверка границ недоступна: {error}" in caplog.text
 
 
 def test_replies_include_quote_from_other_group_member(dispatch):
