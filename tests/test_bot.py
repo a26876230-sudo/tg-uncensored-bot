@@ -488,9 +488,15 @@ def test_reacts_without_sending_text(dispatch):
 
 def test_sends_mood_matched_stickers_and_caches_pack(dispatch):
     events = []
-    assert dispatch(lambda request: completion("[sticker:laugh]\nахаха"),
-                    [make_message("шутка")] * 2, observed=events) == []
+    prompts = []
+
+    def model_api(request):
+        prompts.append(json.loads(request.content)["messages"])
+        return completion("[sticker:laugh]\nахаха")
+
+    assert dispatch(model_api, [make_message("шутка")] * 2, observed=events) == []
     assert events == [("getStickerSet", "Cats"), ("sendSticker", 456, "cat-laugh"), ("sendSticker", 456, "cat-laugh")]
+    assert {"role": "assistant", "content": "Отправила стикер 😹"} in prompts[1]
 
 
 @pytest.mark.parametrize(("raw", "text"), [

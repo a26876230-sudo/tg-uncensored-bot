@@ -416,9 +416,10 @@ class ChatBot:
         memory.next_chime_at = now + CHIME_CHAT_COOLDOWN
         self.next_chime_at = now + CHIME_GLOBAL_COOLDOWN
         return True
-    async def send_sticker(self, message: Message, mood: str) -> bool:
+
+    async def send_sticker(self, message: Message, mood: str) -> str | None:
         if not self.config.sticker_set:
-            return False
+            return None
         try:
             if self.sticker_ids is None:
                 sticker_set = await message.get_bot().get_sticker_set(self.config.sticker_set)
@@ -433,11 +434,12 @@ class ChatBot:
                             self.sticker_ids[name] = file_id
                             break
             if file_id := self.sticker_ids.get(mood):
-                await message.reply_sticker(file_id)
-                return True
+                sent = await message.reply_sticker(file_id)
+                emoji = sent.sticker.emoji if sent.sticker else None
+                return f"Отправила стикер {emoji}" if emoji else "Отправила стикер"
         except TelegramError as exc:
             LOG.warning("Не удалось отправить стикер: %s", type(exc).__name__)
-        return False
+        return None
 
     async def send_reply(self, message: Message, reply: TelegramReply) -> str:
         if reply.reaction:
@@ -446,8 +448,8 @@ class ChatBot:
                     return f"Поставила реакцию {reply.reaction}"
             except TelegramError as exc:
                 LOG.warning("Не удалось поставить реакцию: %s", type(exc).__name__)
-        if reply.sticker_mood and await self.send_sticker(message, reply.sticker_mood):
-            return f"Отправила стикер {STICKER_MOODS[reply.sticker_mood][0]}"
+        if reply.sticker_mood and (sent := await self.send_sticker(message, reply.sticker_mood)):
+            return sent
         for bubble in reply.bubbles:
             async with show_typing(message):
                 await pause_before_bubble(bubble)
