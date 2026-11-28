@@ -148,6 +148,9 @@ def main():
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     load_dotenv()
+    if os.environ.get("CHAT_BOT_TOKEN", "").strip() and not os.environ.get("UNLEASHED_API_KEY", "").strip():
+        LOG.warning("Чат-бот не запущен: не задан UNLEASHED_API_KEY.")
+        return
     try:
         config = Config.from_env()
     except ValueError as exc:
