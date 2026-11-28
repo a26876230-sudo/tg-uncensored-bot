@@ -983,6 +983,36 @@ def test_people_memory_learns_locally_and_recall_is_scoped_and_persistent(dispat
     }]
 
 
+@pytest.mark.parametrize("source", ["forward", "blockquote", "expandable_blockquote_caption"])
+def test_people_memory_does_not_attribute_forwarded_or_quoted_facts_to_sender(dispatch, source):
+    quote = "Люблю рок."
+    if source == "forward":
+        message = make_message(quote, -1, "group", forward_origin={
+            "type": "user", "date": 1, "sender_user": {**USER, "id": 789},
+        })
+    else:
+        prefix = "😀. "
+        body = prefix + quote + "\nРаботаю врачом."
+        entity = {"type": source.split("_caption")[0], "offset": 4, "length": len(quote)}
+        if source.endswith("_caption"):
+            message = make_message(None, -1, "group", caption=body, caption_entities=[entity])
+        else:
+            message = make_message(body, -1, "group", entities=[entity])
+
+    def model_api(request):
+        messages = json.loads(request.content)["messages"]
+        notes = next(msg["content"] for msg in messages if msg["content"].startswith("Заметки об участниках"))
+        person, = json.loads(notes.split("\n", 1)[1])
+        assert person["интересы"] == "джаз"
+        if source != "forward":
+            assert person["занятие"] == "врачом"
+        return completion("помню")
+
+    assert dispatch(model_api, [
+        make_message("Люблю джаз.", -1, "group"), message, make_message("Нори, вспомни", -1, "group"),
+    ]) == [(-1, "помню")]
+
+
 CHIME_TEXT = "Этот новый фильм про далёкий космос мне определённо понравился!"
 
 

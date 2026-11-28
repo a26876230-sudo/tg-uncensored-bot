@@ -39,6 +39,7 @@ PROFILE_FACTS = {
     "занятие": r"(?:я\s+)?(?:работаю|учусь|занимаюсь)\s+([^.!?;\n]{1,100})(?=[.!?;\n]|$)",
     "интересы": r"(?:я\s+)?(?:люблю|увлекаюсь|интересуюсь)\s+([^.!?;\n]{1,100})(?=[.!?;\n]|$)",
 }
+PROFILE_QUOTE_TYPES = {MessageEntityType.BLOCKQUOTE, MessageEntityType.EXPANDABLE_BLOCKQUOTE}
 CHIME_MIN_MESSAGES = 20
 CHIME_CHAT_COOLDOWN = 60 * 60
 CHIME_GLOBAL_COOLDOWN = 15 * 60
@@ -248,7 +249,7 @@ class MemoryStore:
     def remember_person(self, chat_id: int, user_id: int, name: str, text: str):
         facts = {}
         for field, pattern in PROFILE_FACTS.items():
-            match = re.search(rf"(?:^|[.!?;]\s+){pattern}", text, re.IGNORECASE)
+            match = re.search(rf"(?:^|[.!?;]\s+|\n\s*){pattern}", text, re.IGNORECASE)
             if match and (value := match[1].strip()):
                 facts[field] = value[:100]
         if not facts:
@@ -524,6 +525,29 @@ class ChatBot:
                 return text
         return None
 
+    def person_fact_text(self, message: Message, text: str, username: str) -> str:
+        entities = message.entities if message.text else message.caption_entities
+        quotes = sorted(
+            (entity.offset * 2, (entity.offset + entity.length) * 2)
+            for entity in entities if entity.type in PROFILE_QUOTE_TYPES
+        )
+        if quotes:
+            encoded = text.encode("utf-16-le")
+            segments = []
+            cursor = 0
+            for start, end in quotes:
+                if cursor < start:
+                    segments.append(encoded[cursor:start].decode("utf-16-le"))
+                cursor = max(cursor, end)
+            segments.append(encoded[cursor:].decode("utf-16-le"))
+            text = "\n".join(segments)
+        text = text.strip()
+        command = NORI_COMMAND.fullmatch(text)
+        if command and (not command[1] or command[1].casefold() == username.casefold()):
+            text = command[2]
+        address = self.name_pattern.match(text.casefold())
+        return text[address.end():].lstrip(" ,:") if address else text
+
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = update.message
         if not message:
@@ -550,11 +574,8 @@ class ChatBot:
         chat_id = message.chat.id
         memory = self.memories.setdefault(chat_id, ChatMemory())
         user = message.from_user if not message.sender_chat else None
-        if user:
-            fact_text = text.strip() if query is None else query
-            address = self.name_pattern.match(fact_text.casefold())
-            if address:
-                fact_text = fact_text[address.end():].lstrip(" ,:")
+        if user and not message.forward_origin:
+            fact_text = self.person_fact_text(message, text, context.bot.username)
             self.store.remember_person(chat_id, user.id, user.full_name, fact_text)
         sender = message.sender_chat.title if message.sender_chat else None
         if not sender:
