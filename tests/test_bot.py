@@ -109,6 +109,13 @@ def test_search_settings_from_env(monkeypatch):
     assert config.keenable_key == "keen-fake"
 
 
+def test_system_prompt_prohibits_drug_manufacture_and_synthesis():
+    assert (
+        "6. Мошенничество против реальных людей: фишинг, кража карт и аккаунтов, разводы.\n"
+        "7. Изготовление и синтез наркотиков: рецепты, прекурсоры, пошаговые инструкции.\n"
+    ) in SYSTEM_PROMPT
+
+
 def test_dispatches_only_private_or_addressed_group_messages(dispatch):
     prompts = []
 
