@@ -9,8 +9,8 @@ from telegram import Update
 from telegram.request import HTTPXRequest
 
 from bot import (
-    BOUNDARY_PROMPT, BOUNDARY_REFUSAL,
-    DEFAULT_BOT_NAME, DEFAULT_MODEL, SEARCH_NOTE, SUMMARY_PROMPT, SYSTEM_PROMPT,
+    BOUNDARY_OVERLOAD, BOUNDARY_PROMPT, BOUNDARY_REFUSAL,
+    DEFAULT_BOT_NAME, DEFAULT_MODEL, SEARCH_NOTE, SIMPLE_REPLY_NOTE, SUMMARY_PROMPT, SYSTEM_PROMPT,
     ChatBot, ChatMemory, Config, build_application,
 )
 
@@ -137,7 +137,9 @@ def test_dispatches_only_private_or_addressed_group_messages(dispatch):
         assert request.headers["Authorization"] == "Bearer ulk-fake"
         payload = json.loads(request.content)
         assert payload["model"] == "selected-model"
-        assert payload["messages"][0] == {"role": "system", "content": f"{SYSTEM_PROMPT}\nТебя зовут Нори."}
+        assert payload["messages"][0] == {
+            "role": "system", "content": f"{SYSTEM_PROMPT}\n{SIMPLE_REPLY_NOTE}\nТебя зовут Нори.",
+        }
         prompts.append(payload["messages"][1:])
         return completion("ответ")
 
@@ -233,9 +235,9 @@ def test_search_skips_simple_greetings_but_not_a_question_with_a_greeting(dispat
         return completion("ответ")
 
     messages = [make_message(text) for text in [
-        "Привет, Нори!", "СПАСИБО, @chat_bot!", "Привет, какой курс биткоина сегодня?",
+        "Привет, Нори!", "СПАСИБО, @chat_bot!", "Привет, как дела?", "Привет, какой курс биткоина сегодня?",
     ]]
-    assert dispatch(api, messages, search_enabled=True) == [(456, "ответ")] * 3
+    assert dispatch(api, messages, search_enabled=True) == [(456, "ответ")] * 4
     assert searches == ["Привет, какой курс биткоина сегодня?"]
 
 
@@ -258,31 +260,23 @@ def test_refreshes_typing_while_waiting_for_completion(dispatch, monkeypatch):
     assert actions >= 2
 
 
-@pytest.mark.parametrize("verdict", ["ДА СЛОЖНО", "ДА", "ДА СЛОЖНО лишнее", "ДА, поясню"])
-def test_boundary_checks_quote_during_search_and_saves_refused_exchange(dispatch, verdict):
-    searching = asyncio.Event()
-    cancelled = asyncio.Event()
+@pytest.mark.parametrize("verdict", ["2", "ДА СЛОЖНО", "ДА", "ДА СЛОЖНО лишнее", "ДА, поясню"])
+def test_boundary_checks_quote_before_search_and_saves_refused_exchange(dispatch, verdict):
     content = "Owner: Нори, как это сделать?\n\nЦитата из сообщения, на которое отвечают:\nОпасный запрос"
     oldest = make_message("пассивная реплика", -1, "group")
     quoted = make_message("Опасный запрос", -1, "group")
     addressed = make_message("Нори, как это сделать?", -1, "group", reply_to_message=quoted)
 
-    async def model_api(request):
-        assert request.url.host == "api.keenable.ai", "Blocked requests must not reach the main model"
-        searching.set()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cancelled.set()
+    def model_api(request):
+        pytest.fail("Blocked requests must not reach search or the main model")
 
     async def boundary_api(request):
-        await asyncio.wait_for(searching.wait(), timeout=1)
         body = json.loads(request.content)
         assert body == {
             "model": "selected-model",
             "messages": [{"role": "system", "content": BOUNDARY_PROMPT}, {"role": "user", "content": content}],
             "reasoning_effort": "none",
-            "max_tokens": 16,
+            "max_tokens": 8,
         }
         rules = re.findall(r"^\d+\. .*", SYSTEM_PROMPT, re.MULTILINE)
         assert len(rules) == 7
@@ -291,7 +285,6 @@ def test_boundary_checks_quote_during_search_and_saves_refused_exchange(dispatch
 
     assert dispatch(model_api, [oldest, addressed], model="selected-model", search_enabled=True,
                     boundary_api=boundary_api) == [(-1, BOUNDARY_REFUSAL)]
-    assert cancelled.is_set()
 
     def next_completion(request):
         history = json.loads(request.content)["messages"][1:-1]
@@ -307,26 +300,66 @@ def test_boundary_checks_quote_during_search_and_saves_refused_exchange(dispatch
 
 @pytest.mark.parametrize(("failure", "error"), [("verdict", "ValueError"), ("http", "HTTPStatusError"),
                                              ("timeout", "TimeoutError")])
-def test_boundary_failure_is_logged_and_normal_reply_continues(dispatch, monkeypatch, caplog, failure, error):
+@pytest.mark.parametrize("search_enabled", [False, True])
+def test_boundary_failure_sends_overload_without_saving_a_draft(
+    dispatch, monkeypatch, caplog, failure, error, search_enabled,
+):
+    drafted = asyncio.Event()
     if failure == "timeout":
         monkeypatch.setattr("bot.BOUNDARY_TIMEOUT", 0.01)
 
     async def boundary_api(request):
+        if not search_enabled:
+            await asyncio.wait_for(drafted.wait(), timeout=1)
         if failure == "timeout":
             await asyncio.Event().wait()
         if failure == "http":
-            return httpx.Response(503)
+            return httpx.Response(429)
         return completion("НЕ ЗНАЮ")
 
     def model_api(request):
+        assert not search_enabled, "An unchecked query must not reach search or its completion"
         assert json.loads(request.content)["reasoning_effort"] == "none"
+        drafted.set()
+        return completion("непроверенный черновик")
+
+    assert dispatch(model_api, [make_message("вопрос")], search_enabled=search_enabled,
+                    boundary_api=boundary_api) == [(456, BOUNDARY_OVERLOAD)]
+    assert drafted.is_set() is not search_enabled
+    assert f"Проверка границ недоступна: {error}" in caplog.text
+
+    def next_completion(request):
+        assert json.loads(request.content)["messages"][1:] == [{"role": "user", "content": "новый вопрос"}]
         return completion("ответ")
 
-    assert dispatch(model_api, [make_message("вопрос")], boundary_api=boundary_api) == [(456, "ответ")]
-    assert f"Проверка границ недоступна: {error}" in caplog.text
+    assert dispatch(next_completion, [make_message("новый вопрос")]) == [(456, "ответ")]
+
+
+@pytest.mark.parametrize(("verdict", "reply"), [("0", "черновик"), ("1", "итог"), ("2", BOUNDARY_REFUSAL)])
+def test_no_search_starts_a_draft_before_the_verdict_and_sends_only_the_selected_reply(dispatch, verdict, reply):
+    drafted = asyncio.Event()
+    modes = []
+
+    async def boundary_api(request):
+        await asyncio.wait_for(drafted.wait(), timeout=1)
+        return completion(verdict)
+
+    def model_api(request):
+        mode = json.loads(request.content)["reasoning_effort"]
+        modes.append(mode)
+        if mode == "none":
+            drafted.set()
+            return completion("черновик")
+        return completion("итог")
+
+    assert dispatch(model_api, [make_message("привет, как дела?")], search_enabled=True,
+                    boundary_api=boundary_api) == [(456, reply)]
+    assert modes == (["none", "high"] if verdict == "1" else ["none"])
 
 
 @pytest.mark.parametrize(("verdict", "effort", "budget"), [
+    ("0", "none", 1200),
+    ("1", "high", 4096),
     ("НЕТ ПРОСТО", "none", 1200),
     ("НЕТ | СЛОЖНО", "high", 4096),
     ("НЕТ, СЛОЖНО.", "high", 4096),
@@ -334,17 +367,28 @@ def test_boundary_failure_is_logged_and_normal_reply_continues(dispatch, monkeyp
     ("НЕТ", "none", 1200),
 ])
 def test_uses_reasoning_only_for_a_valid_complex_verdict(dispatch, verdict, effort, budget):
+    checked = False
+
+    def boundary_api(request):
+        nonlocal checked
+        checked = True
+        return completion(verdict)
+
     def model_api(request):
+        assert checked
+        if request.url.host == "api.keenable.ai":
+            return httpx.Response(200, json={"results": []})
         body = json.loads(request.content)
         assert body["reasoning_effort"] == effort
         assert body["max_tokens"] == budget
+        assert (SIMPLE_REPLY_NOTE in body["messages"][0]["content"]) == (effort == "none")
         return httpx.Response(200, json={"choices": [{
             "message": {"content": "ответ", "reasoning_content": "внутренний текст"},
             "finish_reason": "stop",
         }]})
 
-    assert dispatch(model_api, [make_message("вопрос")],
-                    boundary_api=lambda request: completion(verdict)) == [(456, "ответ")]
+    assert dispatch(model_api, [make_message("вопрос")], search_enabled=True,
+                    boundary_api=boundary_api) == [(456, "ответ")]
 
 
 def test_replies_include_quote_from_other_group_member(dispatch):
@@ -547,7 +591,7 @@ def test_search_failures_still_answer_without_sources(dispatch, failure):
                 return httpx.Response(200, text="not JSON")
             return httpx.Response(failure)
         assert json.loads(request.content)["messages"] == [
-            {"role": "system", "content": f"{SYSTEM_PROMPT}\nТебя зовут Нори."},
+            {"role": "system", "content": f"{SYSTEM_PROMPT}\n{SIMPLE_REPLY_NOTE}\nТебя зовут Нори."},
             {"role": "user", "content": "вопрос"},
         ]
         return completion("ответ без поиска")
