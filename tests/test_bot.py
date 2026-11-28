@@ -469,6 +469,14 @@ def test_dispatch_keeps_fenced_code_in_one_bubble_with_indentation(dispatch):
     ]
 
 
+def test_literal_backtick_in_inline_span_does_not_hide_following_fence(dispatch):
+    block = "```py\nvalue = '`'\n\n    " + "x" * BUBBLE_LIMIT + "\n```"
+    answer = f"Разделитель: ``a`b``\n\n{block}"
+    assert dispatch(lambda request: completion(answer), [make_message("покажи код")]) == [
+        (456, f"Разделитель: a`b\n\n{block}"),
+    ]
+
+
 def test_dispatch_keeps_each_intro_with_its_fenced_code(dispatch):
     first = "Сначала объяви переменную:\n\n```py\nitems = []\n```"
     second = "Потом добавь элемент:\n\n```py\nitems.append(1)\n```"

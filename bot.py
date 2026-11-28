@@ -269,6 +269,14 @@ def prose_chunks(text: str):
             yield block
 
 
+def strip_inline_code(text: str) -> str:
+    def unwrap(code: re.Match[str]) -> str:
+        ticks = len(code["ticks"] or "")
+        return code[0][ticks:-ticks] if ticks else code[0]
+
+    return REPLY_CODE.sub(unwrap, text)
+
+
 def bubble_chunks(text: str):
     start = 0
     for code in REPLY_CODE.finditer(text):
@@ -279,12 +287,11 @@ def bubble_chunks(text: str):
         if prose:
             with_intro = f"{prose[-1]}\n\n{block}"
             if next(split_text(with_intro)) == with_intro:
-                prose.pop()
-                block = with_intro
-        yield from ((part, False) for part in prose)
+                block = f"{strip_inline_code(prose.pop())}\n\n{block}"
+        yield from ((strip_inline_code(part), False) for part in prose)
         yield from ((part, True) for part in split_text(block))
         start = code.end()
-    yield from ((part, False) for part in prose_chunks(text[start:]))
+    yield from ((strip_inline_code(part), False) for part in prose_chunks(text[start:]))
 
 
 def parse_reply(answer: str) -> TelegramReply:
@@ -294,9 +301,7 @@ def parse_reply(answer: str) -> TelegramReply:
     for code in REPLY_CODE.finditer(answer):
         prose = answer[start:code.start()]
         markers.extend((start + match.start(), match) for match in REPLY_MARKER.finditer(prose))
-        ticks = len(code["ticks"] or "")
-        literal = code[0][ticks:-ticks] if ticks else code[0]
-        pieces.extend((REPLY_MARKER.sub(lambda match: "\n\n" if match[1] else "", prose), literal))
+        pieces.extend((REPLY_MARKER.sub(lambda match: "\n\n" if match[1] else "", prose), code[0]))
         start = code.end()
     prose = answer[start:]
     markers.extend((start + match.start(), match) for match in REPLY_MARKER.finditer(prose))
