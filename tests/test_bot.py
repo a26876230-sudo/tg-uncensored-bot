@@ -440,6 +440,13 @@ def test_dispatch_keeps_fenced_code_in_one_bubble_with_indentation(dispatch):
     ]
 
 
+def test_dispatch_keeps_each_intro_with_its_fenced_code(dispatch):
+    first = "Сначала объяви переменную:\n\n```py\nitems = []\n```"
+    second = "Потом добавь элемент:\n\n```py\nitems.append(1)\n```"
+    assert dispatch(lambda request: completion(f"{first}\n[next]\n{second}"),
+                    [make_message("два примера кода")]) == [(456, first), (456, second)]
+
+
 def test_large_fenced_code_respects_telegram_utf16_limit():
     block = "~~~txt\n" + "🙂" * 2049 + "  \n~~~"
     bubbles = parse_reply(block).bubbles

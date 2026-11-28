@@ -269,8 +269,15 @@ def bubble_chunks(text: str):
     for code in REPLY_CODE.finditer(text):
         if code["fence"] is None:
             continue
-        yield from ((part, False) for part in prose_chunks(text[start:code.start()]))
-        yield from ((part, True) for part in split_text(code[0]))
+        prose = list(prose_chunks(text[start:code.start()]))
+        block = code[0]
+        if prose:
+            with_intro = f"{prose[-1]}\n\n{block}"
+            if next(split_text(with_intro)) == with_intro:
+                prose.pop()
+                block = with_intro
+        yield from ((part, False) for part in prose)
+        yield from ((part, True) for part in split_text(block))
         start = code.end()
     yield from ((part, False) for part in prose_chunks(text[start:]))
 
