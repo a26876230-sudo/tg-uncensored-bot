@@ -9,6 +9,7 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 
 import httpx
@@ -20,6 +21,8 @@ from telegram.error import TelegramError
 from telegram.ext import Application, ContextTypes, Defaults, MessageHandler, filters
 
 from nori_media import MediaError, VISION_MODEL, VoiceSynthesizer, read_media
+from telegram_common import split_text
+
 
 LOG = logging.getLogger(__name__)
 UNLEASHED_BASE_URL = "https://api.unleashedapi.com/v1/"
@@ -244,7 +247,7 @@ class TelegramReply:
     sticker_mood: str | None = None
 
 
-def bubble_chunks(text: str):
+def prose_chunks(text: str):
     for block in re.split(r"\n\s*\n", text):
         block = block.strip()
         while len(block) > BUBBLE_LIMIT:
@@ -261,8 +264,18 @@ def bubble_chunks(text: str):
             yield block
 
 
+def bubble_chunks(text: str):
+    start = 0
+    for code in REPLY_CODE.finditer(text):
+        if code["fence"] is None:
+            continue
+        yield from ((part, False) for part in prose_chunks(text[start:code.start()]))
+        yield from ((part, True) for part in split_text(code[0]))
+        start = code.end()
+    yield from ((part, False) for part in prose_chunks(text[start:]))
+
+
 def parse_reply(answer: str) -> TelegramReply:
-    answer = answer.rstrip()
     markers = []
     pieces = []
     start = 0
@@ -276,9 +289,9 @@ def parse_reply(answer: str) -> TelegramReply:
     pieces.append(REPLY_MARKER.sub(lambda match: "\n\n" if match[1] else "", prose))
     first = markers[0][1] if len(markers) == 1 and not answer[:markers[0][0]].strip() else None
     text = "".join(pieces)
-    bubbles = list(bubble_chunks(text))
-    if len(bubbles) > MAX_BUBBLES:
-        bubbles = bubbles[:MAX_BUBBLES]
+    chunks = list(islice(bubble_chunks(text), MAX_BUBBLES + 1))
+    bubbles = [part for part, _ in chunks[:MAX_BUBBLES]]
+    if len(chunks) > MAX_BUBBLES and not chunks[MAX_BUBBLES - 1][1]:
         bubbles[-1] = bubbles[-1][:BUBBLE_LIMIT - 1].rstrip(" …") + "…"
     if first and first[2] and first[3] and first[4]:
         kind, value = first[2].lower(), first[3].strip()
@@ -505,10 +518,9 @@ class ChatBot:
             answer = None
         if not isinstance(answer, str) or not answer.strip():
             raise ValueError("Пустой или некорректный ответ UnleashedAPI.")
-        answer = answer.strip()
         if mark_truncated and choice.get("finish_reason") == "length":
             answer += " …"
-        return answer
+        return answer if mark_truncated else answer.strip()
 
     async def classify_message(
         self, latest: dict[str, str], *, answer: str | None = None, skip_if_busy: bool = False,

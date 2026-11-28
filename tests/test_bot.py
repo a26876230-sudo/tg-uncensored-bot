@@ -433,6 +433,21 @@ def test_parse_telegram_reply(raw, reply):
     assert parse_reply(raw) == reply
 
 
+def test_dispatch_keeps_fenced_code_in_one_bubble_with_indentation(dispatch):
+    block = "  ```py\n    def f():\n\n        return '" + "🙂" * BUBBLE_LIMIT + "'  \n  ```  "
+    assert dispatch(lambda request: completion(f"{block}\n[next] готово"), [make_message("покажи код")]) == [
+        (456, block), (456, "готово"),
+    ]
+
+
+def test_large_fenced_code_respects_telegram_utf16_limit():
+    block = "~~~txt\n" + "🙂" * 2049 + "  \n~~~"
+    bubbles = parse_reply(block).bubbles
+    assert len(bubbles) == 2
+    assert "".join(bubbles) == block
+    assert all(len(bubble.encode("utf-16-le")) <= 4096 * 2 for bubble in bubbles)
+
+
 def test_typing_pause_grows_with_text_and_is_bounded(monkeypatch):
     sleep = AsyncMock()
     monkeypatch.setattr("bot.asyncio.sleep", sleep)
