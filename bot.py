@@ -198,11 +198,12 @@ class ChatBot:
         return await self.request_completion([*messages, *memory.recent, latest])
 
     async def remember(self, chat_id: int, memory: ChatMemory, *messages: dict[str, str]):
-        memory.recent.extend(messages)
+        updated = ChatMemory(deque([*memory.recent, *messages]), memory.summary)
         oldest = []
-        if len(memory.recent) > HISTORY_MESSAGES:
-            oldest = [memory.recent.popleft() for _ in range(SUMMARY_BATCH)]
-        self.store.save(chat_id, memory)
+        if len(updated.recent) > HISTORY_MESSAGES:
+            oldest = [updated.recent.popleft() for _ in range(SUMMARY_BATCH)]
+        self.store.save(chat_id, updated)
+        memory.recent = updated.recent
         if not oldest:
             return
         try:
@@ -213,11 +214,12 @@ class ChatBot:
                         "previous_summary": memory.summary, "messages": oldest,
                     }, ensure_ascii=False)},
                 ], max_tokens=500)
-            memory.summary = summary[:2000]
         except (TimeoutError, httpx.HTTPError, ValueError) as exc:
             LOG.warning("Не удалось обновить пересказ разговора: %s", type(exc).__name__)
         else:
-            self.store.save(chat_id, memory)
+            updated.summary = summary[:2000]
+            self.store.save(chat_id, updated)
+            memory.summary = updated.summary
 
     def addressed_query(self, message: Message, text: str, bot_id: int, username: str) -> str | None:
         command = NORI_COMMAND.fullmatch(text)

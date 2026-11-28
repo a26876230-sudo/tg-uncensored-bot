@@ -1,12 +1,16 @@
 import asyncio
 import json
+import sqlite3
 
 import httpx
 import pytest
 from telegram import Update
 from telegram.request import HTTPXRequest
 
-from bot import DEFAULT_BOT_NAME, DEFAULT_MODEL, SEARCH_NOTE, SUMMARY_PROMPT, SYSTEM_PROMPT, Config, build_application
+from bot import (
+    DEFAULT_BOT_NAME, DEFAULT_MODEL, SEARCH_NOTE, SUMMARY_PROMPT, SYSTEM_PROMPT,
+    ChatBot, ChatMemory, Config, build_application,
+)
 
 
 BOT = {"id": 123, "is_bot": True, "first_name": "Chat", "username": "chat_bot"}
@@ -240,6 +244,47 @@ def test_group_memory_summarizes_in_batches_without_losing_recent_text(dispatch,
             "previous_summary": "" if index == 0 else "пересказ 1",
             "messages": [{"role": "user", "content": f"Owner: запись {i}"} for i in range(index * 15, (index + 1) * 15)],
         }
+
+
+def test_failed_sqlite_write_preserves_history_for_next_summary(tmp_path):
+    summaries = []
+
+    def model_api(request):
+        payload = json.loads(request.content)["messages"]
+        assert payload[0]["content"] == SUMMARY_PROMPT
+        summaries.append(json.loads(payload[1]["content"])["messages"])
+        return completion("пересказ")
+
+    async def run():
+        config = Config("123:fake", "ulk-fake", db_path=tmp_path / "chat.sqlite3")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(model_api)) as http:
+            chatbot = ChatBot(config, http)
+            try:
+                memory = ChatMemory()
+                entries = [{"role": "user", "content": f"запись {i}"} for i in range(51)]
+                for entry in entries[:-1]:
+                    await chatbot.remember(-1, memory, entry)
+                db = chatbot.store.db
+                db.execute("""
+                    CREATE TRIGGER fail_write BEFORE INSERT ON chat_memory
+                    BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END
+                """)
+                with pytest.raises(sqlite3.IntegrityError, match="simulated write failure"):
+                    await chatbot.remember(-1, memory, entries[-1])
+                assert list(memory.recent) == entries[:-1]
+                assert chatbot.store.load()[-1] == memory
+                assert not summaries
+
+                db.execute("DROP TRIGGER fail_write")
+                await chatbot.remember(-1, memory, entries[-1])
+                assert summaries == [entries[:15]]
+                assert list(memory.recent) == entries[15:]
+                assert memory.summary == "пересказ"
+                assert chatbot.store.load()[-1] == memory
+            finally:
+                chatbot.store.close()
+
+    asyncio.run(run())
 
 
 def test_recreated_bot_loads_recent_messages_and_summary_for_the_same_chat(dispatch):
