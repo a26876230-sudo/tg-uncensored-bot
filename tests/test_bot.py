@@ -1053,6 +1053,36 @@ def test_people_memory_learns_after_a_leading_bot_address(dispatch, address):
 CHIME_TEXT = "Этот новый фильм про далёкий космос мне определённо понравился!"
 
 
+def test_media_caption_does_not_trigger_a_chime_in(dispatch, monkeypatch):
+    monkeypatch.setattr("bot.random.random", lambda: 0)
+
+    def unexpected(request):
+        pytest.fail(f"unexpected provider request: {request.url.host}")
+
+    messages = [make_message("обычное сообщение", -1, "group")] * (CHIME_MIN_MESSAGES - 1)
+    messages.append(make_message(None, -1, "group", caption=CHIME_TEXT, photo=PHOTOS))
+    assert dispatch(unexpected, messages, boundary_api=unexpected, groq_key="groq-fake") == []
+
+
+def test_people_memory_does_not_learn_from_a_voice_transcript(dispatch, monkeypatch):
+    async def synthesize(self, text):
+        return b"synthetic mp3"
+
+    def api(request):
+        if request.url.host == "api.groq.com":
+            return httpx.Response(200, json={"text": "Люблю рок."})
+        messages = json.loads(request.content)["messages"]
+        notes = next(msg["content"] for msg in messages if msg["content"].startswith("Заметки об участниках"))
+        person, = json.loads(notes.split("\n", 1)[1])
+        assert person["интересы"] == "джаз"
+        return completion("помню")
+
+    monkeypatch.setattr("nori_media.VoiceSynthesizer.synthesize", synthesize)
+    assert dispatch(api, [
+        make_message("Люблю джаз."), make_message(None, voice=telegram_voice()), make_message("Вспомни"),
+    ], groq_key="groq-fake") == [(456, "помню"), (456, "<voice>"), (456, "помню")]
+
+
 def test_chime_in_requires_topic_roll_message_count_and_cooldowns(dispatch, monkeypatch):
     clock = 0
     roll = 0
