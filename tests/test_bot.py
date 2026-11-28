@@ -27,11 +27,17 @@ def make_message(text, chat_id=456, chat_type="private", **fields):
 @pytest.fixture
 def dispatch(monkeypatch, tmp_path):
     sent = []
+    typing_callback = None
 
     async def telegram_api(self, url, method, request_data=None, **kwargs):
         endpoint = url.rsplit("/", 1)[-1]
         if endpoint == "getMe":
             result = BOT
+        elif endpoint == "sendChatAction":
+            assert request_data.parameters["action"] == "typing"
+            if typing_callback:
+                typing_callback()
+            result = True
         elif endpoint == "sendMessage":
             params = request_data.parameters
             assert params["link_preview_options"] == {"is_disabled": True}
@@ -43,7 +49,12 @@ def dispatch(monkeypatch, tmp_path):
 
     monkeypatch.setattr(HTTPXRequest, "do_request", telegram_api)
 
-    def run(model_api, messages, model=DEFAULT_MODEL, *, search_enabled=False, keenable_key="", name=DEFAULT_BOT_NAME):
+    def run(
+        model_api, messages, model=DEFAULT_MODEL, *, search_enabled=False, keenable_key="", name=DEFAULT_BOT_NAME,
+        on_typing=None,
+    ):
+        nonlocal typing_callback
+        typing_callback = on_typing
         sent.clear()
 
         async def process():
@@ -190,7 +201,42 @@ def test_name_and_command_trigger_search_only_when_addressed(dispatch):
     assert dispatch(api, messages, search_enabled=True, name="Луна") == [
         (-1, "ответ"), (-1, "ответ"), (-1, "ответ"), (-1, "ответ"), (-1, "Напишите сообщение текстом."),
     ]
-    assert searches == ["Ты согласна, ЛУНА?", "луна", "первый вопрос", "второй вопрос"]
+    assert searches == ["Ты согласна, ЛУНА?", "первый вопрос", "второй вопрос"]
+
+
+def test_search_skips_simple_greetings_but_not_a_question_with_a_greeting(dispatch):
+    searches = []
+
+    def api(request):
+        if request.url.host == "api.keenable.ai":
+            searches.append(json.loads(request.content)["query"])
+            return httpx.Response(200, json={"results": []})
+        return completion("ответ")
+
+    messages = [make_message(text) for text in [
+        "Привет, Нори!", "СПАСИБО, @chat_bot!", "Привет, какой курс биткоина сегодня?",
+    ]]
+    assert dispatch(api, messages, search_enabled=True) == [(456, "ответ")] * 3
+    assert searches == ["Привет, какой курс биткоина сегодня?"]
+
+
+def test_refreshes_typing_while_waiting_for_completion(dispatch, monkeypatch):
+    monkeypatch.setattr("bot.TYPING_INTERVAL", 0.001)
+    typing_refreshed = asyncio.Event()
+    actions = 0
+
+    def on_typing():
+        nonlocal actions
+        actions += 1
+        if actions == 2:
+            typing_refreshed.set()
+
+    async def model_api(request):
+        await asyncio.wait_for(typing_refreshed.wait(), timeout=1)
+        return completion("ответ")
+
+    assert dispatch(model_api, [make_message("Привет!")], on_typing=on_typing) == [(456, "ответ")]
+    assert actions >= 2
 
 
 def test_replies_include_quote_from_other_group_member(dispatch):
@@ -331,6 +377,7 @@ def test_search_sources_reach_model_but_do_not_enter_history(dispatch, key):
         assert request.method == "POST"
         if request.url.host == "api.keenable.ai":
             calls.append(("search", payload["query"]))
+            assert request.extensions["timeout"]["read"] == 4
             assert payload["max_results"] == 5
             assert "Authorization" not in request.headers
             if key:
@@ -343,6 +390,8 @@ def test_search_sources_reach_model_but_do_not_enter_history(dispatch, key):
             return httpx.Response(200, json={"results": [source, None, second_source]})
         assert request.url.host == "api.unleashedapi.com"
         assert "X-API-Key" not in request.headers
+        assert payload["max_tokens"] == 1200
+        assert payload["reasoning_effort"] == "none"
         messages = payload["messages"]
         assert messages[0]["role"] == "system"
         assert SEARCH_NOTE in messages[0]["content"]
