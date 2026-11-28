@@ -1062,7 +1062,7 @@ def test_chime_in_requires_topic_roll_message_count_and_cooldowns(dispatch, monk
 
     def check(request):
         checked.append(json.loads(request.content)["messages"][-1]["content"])
-        return completion("НЕТ ПРОСТО")
+        return completion("0")
 
     def reply(request):
         assert request.url.host == "api.unleashedapi.com"
@@ -1112,7 +1112,7 @@ def test_chime_in_stays_silent_on_boundary_or_model_failure(dispatch, monkeypatc
         checks.append(content)
         if outcome == "classifier 429":
             return httpx.Response(429)
-        return completion({"blocked": "ДА ПРОСТО", "invalid": "ошибка", "reply 429": "НЕТ ПРОСТО"}[outcome])
+        return completion({"blocked": "2", "invalid": "ошибка", "reply 429": "0"}[outcome])
 
     def reply(request):
         replies.append(request)
@@ -1134,3 +1134,52 @@ def test_chime_in_stays_silent_on_boundary_or_model_failure(dispatch, monkeypatc
     assert dispatch(reply, messages(), boundary_api=check) == []
     assert len(checks) == 1
     assert len(replies) == (outcome == "reply 429")
+
+
+@pytest.mark.parametrize("verdict", ["0", "2", "1"])
+def test_chime_in_skips_busy_limiter_and_uses_shared_slots_for_both_safety_checks(dispatch, monkeypatch, verdict):
+    slots = asyncio.Semaphore(2)
+    monkeypatch.setattr("bot.UNLEASHED_SLOTS", slots)
+    monkeypatch.setattr("bot.random.random", lambda: 0)
+    answer = "В черновике упоминается гексоген."
+    calls = []
+
+    async def reserve_slots():
+        await slots.acquire()
+        await slots.acquire()
+
+    asyncio.run(reserve_slots())
+
+    def check(request):
+        assert slots.locked()
+        prompt, content = json.loads(request.content)["messages"]
+        if prompt["content"] == BOUNDARY_PROMPT:
+            assert content["content"] == f"Owner: {CHIME_TEXT}"
+            calls.append("input")
+            return completion("0")
+        assert prompt["content"] == ANSWER_BOUNDARY_PROMPT
+        assert json.loads(content["content"]) == {"request": f"Owner: {CHIME_TEXT}", "answer": answer}
+        calls.append("output")
+        return completion(verdict)
+
+    def reply(request):
+        assert slots.locked()
+        calls.append("draft")
+        return completion(answer)
+
+    def messages():
+        for _ in range(CHIME_MIN_MESSAGES - 1):
+            yield make_message("обычное сообщение", -1, "group")
+        release_on_timeout = asyncio.get_running_loop().call_later(0.1, slots.release)
+        try:
+            yield make_message(CHIME_TEXT, -1, "group")
+            assert not calls
+        finally:
+            if slots.locked():
+                slots.release()
+            release_on_timeout.cancel()
+        yield make_message(CHIME_TEXT, -1, "group")
+
+    expected = [(-1, answer)] if verdict == "0" else []
+    assert dispatch(reply, messages(), boundary_api=check) == expected
+    assert calls == ["input", "draft", "output"]
