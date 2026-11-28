@@ -97,7 +97,9 @@ class ChatBot:
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = update.message
-        if not message or (message.from_user and message.from_user.is_bot):
+        if not message:
+            return
+        if message.from_user and message.from_user.is_bot and not message.sender_chat:
             return
         if not self.addressed_to(message, context.bot.id, context.bot.username):
             return

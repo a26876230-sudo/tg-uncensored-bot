@@ -122,6 +122,27 @@ def test_caps_history_and_splits_reply_at_telegram_limit(dispatch):
     ]
 
 
+def test_accepts_anonymous_admin_but_ignores_a_bot(dispatch):
+    prompts = []
+
+    def model_api(request):
+        prompts.append(json.loads(request.content)["messages"][-1]["content"])
+        return completion("ответ")
+
+    group = {"id": -100123, "type": "supergroup", "title": "Группа"}
+    anonymous = {"id": 1087968824, "is_bot": True, "first_name": "Group", "username": "GroupAnonymousBot"}
+    mention = [{"type": "mention", "offset": 0, "length": 9}]
+    messages = [
+        make_message("@chat_bot робот", group["id"], group["type"], entities=mention, **{"from": BOT}),
+        make_message(
+            "@chat_bot админ", group["id"], group["type"],
+            entities=mention, sender_chat=group, **{"from": anonymous},
+        ),
+    ]
+    assert dispatch(model_api, messages) == [(group["id"], "ответ")]
+    assert prompts == ["@chat_bot админ"]
+
+
 @pytest.mark.parametrize(
     ("response", "reply"),
     [
