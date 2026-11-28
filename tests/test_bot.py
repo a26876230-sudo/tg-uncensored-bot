@@ -442,7 +442,7 @@ def test_caps_oversized_model_reply_at_three_short_bubbles(dispatch):
     ("ага [NEXT]\n так и есть", TelegramReply(("ага", "так и есть"))),
     ("один\n\nдва\n\nтри\n\nчетыре", TelegramReply(("один", "два", "три…"))),
     ("[[ ReAcTiOn: ❤ ]]", TelegramReply(("❤️",), reaction="❤️")),
-    ("`[reaction:👍]` и items[next] [next] готово", TelegramReply(("`[reaction:👍]` и items[next]", "готово"))),
+    ("`[reaction:👍]` и items[next] [next] готово", TelegramReply(("[reaction:👍] и items[next]", "готово"))),
     ("```py\nitems[next] = '[sticker:laugh]'\n```\n[next] готово",
      TelegramReply(("```py\nitems[next] = '[sticker:laugh]'\n```", "готово"))),
     ("важный ответ [reaction:👍]", TelegramReply(("важный ответ",))),
@@ -453,6 +453,13 @@ def test_caps_oversized_model_reply_at_three_short_bubbles(dispatch):
 ])
 def test_parse_telegram_reply(raw, reply):
     assert parse_reply(raw) == reply
+
+
+def test_send_plain_text_without_inline_markdown_backticks(dispatch):
+    reply = "Нажми `start`, потом `/min` или `/b`. Нужен ли `a < b & c`?"
+    assert dispatch(lambda request: completion(reply), [make_message("какие команды?")]) == [
+        (456, "Нажми start, потом /min или /b. Нужен ли a < b & c?"),
+    ]
 
 
 def test_dispatch_keeps_fenced_code_in_one_bubble_with_indentation(dispatch):
