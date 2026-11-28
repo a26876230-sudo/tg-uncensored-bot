@@ -9,6 +9,7 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from itertools import islice
 from pathlib import Path
 
@@ -60,6 +61,9 @@ BOUNDARY_TIMEOUT = 5
 BOUNDARY_REFUSAL = "Не, с этим не помогу."
 BOUNDARY_OVERLOAD = "Перегруз, попробуй через минуту."
 UNLEASHED_SLOTS = asyncio.Semaphore(2)
+UNLEASHED_RETRY_DELAYS = (0.5, 1.0)
+UNLEASHED_RETRY_BUDGET = 4
+UNLEASHED_QUOTA_WINDOWS = ("five_hour", "weekly", "monthly")
 SUMMARY_TIMEOUT = 10
 SUMMARY_PROMPT = (
     "Кратко обнови пересказ разговора: не более 200 слов. Сохрани имена участников, "
@@ -107,6 +111,7 @@ SYSTEM_PROMPT = f"""Ты живой собеседник в Телеграме, 
 Тон зеркалишь: с вежливым вежлив, с шутником шутишь, на грубость отвечаешь грубо и с юмором, но без угроз и без оскорблений по нации, расе, религии, полу и ориентации.
 
 Пиши как в личной переписке, без вступлений и канцелярита. Начни с ответа или результата. Обычно хватит одного сообщения из одного-двух коротких предложений. Второе отправляй только для отдельной мысли или уточнения: поставь отдельный [next] между сообщениями, не внутри кода. В крайнем случае три сообщения, каждое до 280 знаков, кроме блока кода. Используй обычные заглавные и знаки препинания, подстраивайся под собеседника. Эмодзи — только если он помогает передать тон или смысл.
+Обычные реплики и названия команд пиши простым текстом, без Markdown. Отдельный блок кода используй, только когда нужен пример кода.
 Если слов действительно не надо (например, в ответ на благодарность или шутку), выведи только [reaction:ЭМОДЗИ], выбрав один эмодзи из {' '.join(REACTIONS)}.
 Если вместо слов к месту стикер, начни с [sticker:НАСТРОЕНИЕ], выбрав laugh (смех), love (умиление) или celebrate (праздник). После маркера напиши короткую реплику на случай, если стикер недоступен.
 Не заменяй реакцией или стикером содержательный ответ на вопрос или просьбу.
@@ -264,6 +269,14 @@ def prose_chunks(text: str):
             yield block
 
 
+def strip_inline_code(text: str) -> str:
+    def unwrap(code: re.Match[str]) -> str:
+        ticks = len(code["ticks"] or "")
+        return code[0][ticks:-ticks] if ticks else code[0]
+
+    return REPLY_CODE.sub(unwrap, text)
+
+
 def bubble_chunks(text: str):
     start = 0
     for code in REPLY_CODE.finditer(text):
@@ -274,12 +287,11 @@ def bubble_chunks(text: str):
         if prose:
             with_intro = f"{prose[-1]}\n\n{block}"
             if next(split_text(with_intro)) == with_intro:
-                prose.pop()
-                block = with_intro
-        yield from ((part, False) for part in prose)
+                block = f"{strip_inline_code(prose.pop())}\n\n{block}"
+        yield from ((strip_inline_code(part), False) for part in prose)
         yield from ((part, True) for part in split_text(block))
         start = code.end()
-    yield from ((part, False) for part in prose_chunks(text[start:]))
+    yield from ((strip_inline_code(part), False) for part in prose_chunks(text[start:]))
 
 
 def parse_reply(answer: str) -> TelegramReply:
@@ -395,6 +407,28 @@ class UnleashedBusy(Exception):
     pass
 
 
+def quota_window(response: httpx.Response) -> str | None:
+    try:
+        window = response.json()["error"]["window"]
+    except (KeyError, TypeError, ValueError):
+        return None
+    return window if window in UNLEASHED_QUOTA_WINDOWS else None
+
+
+def retry_after_seconds(response: httpx.Response) -> float:
+    value = response.headers.get("Retry-After", "").strip()
+    if value.isdecimal():
+        return float(value)
+    try:
+        return max(0, parsedate_to_datetime(value).timestamp() - time.time())
+    except (OSError, OverflowError, TypeError, ValueError):
+        return 0
+
+
+async def sleep_before_unleashed_retry(seconds: float):
+    await asyncio.sleep(seconds)
+
+
 class ChatBot:
     def __init__(self, config: Config, http: httpx.AsyncClient, groq: AsyncGroq | None = None):
         self.config = config
@@ -507,18 +541,32 @@ class ChatBot:
 
     async def request_completion(
         self, messages: list[dict[str, str]], *, mark_truncated: bool = False,
-        request_timeout: float | None = None, skip_if_busy: bool = False, **options,
+        request_timeout: float | None = None, skip_if_busy: bool = False, retry_429: bool = True, **options,
     ) -> str:
         if skip_if_busy and UNLEASHED_SLOTS.locked():
             raise UnleashedBusy
-        async with UNLEASHED_SLOTS, asyncio.timeout(request_timeout):
-            response = await self.http.post(
-                f"{UNLEASHED_BASE_URL}chat/completions",
-                headers={"Authorization": f"Bearer {self.config.api_key}"},
-                json={"model": self.config.model, "messages": messages, **options},
-            )
-        if response.status_code == 429:
+        remaining = UNLEASHED_RETRY_BUDGET
+        for backoff in (*UNLEASHED_RETRY_DELAYS, None):
+            async with UNLEASHED_SLOTS, asyncio.timeout(request_timeout):
+                response = await self.http.post(
+                    f"{UNLEASHED_BASE_URL}chat/completions",
+                    headers={"Authorization": f"Bearer {self.config.api_key}"},
+                    json={"model": self.config.model, "messages": messages, **options},
+                )
+            if response.status_code != 429:
+                break
             self.quota_cooldown_until = time.monotonic() + CHIME_QUOTA_COOLDOWN
+            if window := quota_window(response):
+                LOG.warning("UnleashedAPI: исчерпана квота (%s)", window)
+                break
+            if skip_if_busy or not retry_429 or backoff is None:
+                break
+            delay = max(backoff, retry_after_seconds(response))
+            if delay > remaining:
+                break
+            remaining -= delay
+            LOG.info("UnleashedAPI: HTTP 429, повтор через %.1f с", delay)
+            await sleep_before_unleashed_retry(delay)
         response.raise_for_status()
         try:
             choice = response.json()["choices"][0]
@@ -655,7 +703,7 @@ class ChatBot:
                 {"role": "user", "content": json.dumps({
                     "previous_summary": memory.summary, "messages": oldest,
                 }, ensure_ascii=False)},
-            ], request_timeout=SUMMARY_TIMEOUT, max_tokens=500)
+            ], request_timeout=SUMMARY_TIMEOUT, retry_429=False, max_tokens=500)
         except (TimeoutError, httpx.HTTPError, ValueError) as exc:
             LOG.warning("Не удалось обновить пересказ разговора: %s", type(exc).__name__)
         else:

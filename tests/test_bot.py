@@ -442,7 +442,7 @@ def test_caps_oversized_model_reply_at_three_short_bubbles(dispatch):
     ("ага [NEXT]\n так и есть", TelegramReply(("ага", "так и есть"))),
     ("один\n\nдва\n\nтри\n\nчетыре", TelegramReply(("один", "два", "три…"))),
     ("[[ ReAcTiOn: ❤ ]]", TelegramReply(("❤️",), reaction="❤️")),
-    ("`[reaction:👍]` и items[next] [next] готово", TelegramReply(("`[reaction:👍]` и items[next]", "готово"))),
+    ("`[reaction:👍]` и items[next] [next] готово", TelegramReply(("[reaction:👍] и items[next]", "готово"))),
     ("```py\nitems[next] = '[sticker:laugh]'\n```\n[next] готово",
      TelegramReply(("```py\nitems[next] = '[sticker:laugh]'\n```", "готово"))),
     ("важный ответ [reaction:👍]", TelegramReply(("важный ответ",))),
@@ -455,10 +455,25 @@ def test_parse_telegram_reply(raw, reply):
     assert parse_reply(raw) == reply
 
 
+def test_send_plain_text_without_inline_markdown_backticks(dispatch):
+    reply = "Нажми `start`, потом `/min` или `/b`. Нужен ли `a < b & c`?"
+    assert dispatch(lambda request: completion(reply), [make_message("какие команды?")]) == [
+        (456, "Нажми start, потом /min или /b. Нужен ли a < b & c?"),
+    ]
+
+
 def test_dispatch_keeps_fenced_code_in_one_bubble_with_indentation(dispatch):
     block = "  ```py\n    def f():\n\n        return '" + "🙂" * BUBBLE_LIMIT + "'  \n  ```  "
     assert dispatch(lambda request: completion(f"{block}\n[next] готово"), [make_message("покажи код")]) == [
         (456, block), (456, "готово"),
+    ]
+
+
+def test_literal_backtick_in_inline_span_does_not_hide_following_fence(dispatch):
+    block = "```py\nvalue = '`'\n\n    " + "x" * BUBBLE_LIMIT + "\n```"
+    answer = f"Разделитель: ``a`b``\n\n{block}"
+    assert dispatch(lambda request: completion(answer), [make_message("покажи код")]) == [
+        (456, f"Разделитель: a`b\n\n{block}"),
     ]
 
 
@@ -1092,10 +1107,78 @@ def test_closes_truncated_fence_before_notifying_user(dispatch, fence):
     assert dispatch(model_api, [make_message("покажи код")]) == [(456, f"{answer}\n{fence}"), (456, "…")]
 
 
+@pytest.mark.parametrize("stage,retry_after,delay", [
+    ("reply", None, 0.5),
+    ("reply", "2", 2),
+    ("input guard", "2", 2),
+    ("output guard", "2", 2),
+])
+def test_addressed_message_recovers_from_transient_429(dispatch, monkeypatch, stage, retry_after, delay):
+    attempts = []
+    sleeps = []
+    question = "чем опасен фишинг?" if stage == "input guard" else "привет"
+    answer = "Улица Тестовая, 42." if stage == "output guard" else "Ответ."
+
+    async def record_sleep(seconds):
+        sleeps.append(seconds)
+
+    def api(request):
+        system = json.loads(request.content)["messages"][0]["content"]
+        if system == BOUNDARY_PROMPT:
+            kind, content = "input guard", "0"
+        elif system == ANSWER_BOUNDARY_PROMPT:
+            kind, content = "output guard", "0"
+        else:
+            kind, content = "reply", answer
+        attempts.append(kind)
+        if kind == stage and attempts.count(stage) == 1:
+            return httpx.Response(429, headers={"Retry-After": retry_after} if retry_after else None)
+        return completion(content)
+
+    monkeypatch.setattr("bot.sleep_before_unleashed_retry", record_sleep, raising=False)
+    friend = make_message(question, 789, **{"from": {**USER, "id": 789, "first_name": "Кент"}})
+    assert dispatch(api, [friend], boundary_api=api) == [(789, answer)]
+    assert attempts.count(stage) == 2
+    assert sleeps == [delay]
+
+
+@pytest.mark.parametrize("headers,payload", [
+    ({}, {"error": {"window": "five_hour"}}),
+    ({"Retry-After": "60"}, {}),
+])
+def test_addressed_message_reports_long_or_quota_429_without_retry(dispatch, headers, payload):
+    attempts = []
+
+    def api(request):
+        attempts.append(request)
+        return httpx.Response(429, headers=headers, json=payload)
+
+    assert dispatch(api, [make_message("привет")]) == [
+        (456, "Достигнут лимит запросов. Попробуйте позже."),
+    ]
+    assert len(attempts) == 1
+
+
+def test_addressed_message_reports_persistent_429_after_bounded_backoff(dispatch, monkeypatch):
+    attempts = []
+    sleep = AsyncMock()
+    monkeypatch.setattr("bot.sleep_before_unleashed_retry", sleep)
+
+    def api(request):
+        attempts.append(request)
+        return httpx.Response(429, headers={"Retry-After": "1"})
+
+    assert dispatch(api, [make_message("привет")]) == [
+        (456, "Достигнут лимит запросов. Попробуйте позже."),
+    ]
+    assert len(attempts) == 3
+    assert [call.args[0] for call in sleep.await_args_list] == [1, 1]
+
+
 @pytest.mark.parametrize(
     ("response", "reply"),
     [
-        (httpx.Response(429), "Достигнут лимит запросов. Попробуйте позже."),
+        (httpx.Response(429, json={"error": {"window": "weekly"}}), "Достигнут лимит запросов. Попробуйте позже."),
         (httpx.Response(503), "Не удалось получить ответ от модели. Попробуйте позже."),
         (completion(None), "Не удалось получить ответ от модели. Попробуйте позже."),
     ],
