@@ -1035,6 +1035,21 @@ def test_people_memory_questions_do_not_overwrite_facts(dispatch, question):
     ])[-1:] == [(-1, "помню")]
 
 
+@pytest.mark.parametrize("address", ["@CHAT_BOT, ", "Нори — "])
+def test_people_memory_learns_after_a_leading_bot_address(dispatch, address):
+    def model_api(request):
+        messages = json.loads(request.content)["messages"]
+        notes = next(msg["content"] for msg in messages if msg["content"].startswith("Заметки об участниках"))
+        person, = json.loads(notes.split("\n", 1)[1])
+        assert person["имя"] == "Лена"
+        return completion("помню")
+
+    assert dispatch(model_api, [
+        make_message(f"{address}меня зовут Лена.", -1, "group"),
+        make_message("Нори, вспомни", -1, "group"),
+    ])[-1:] == [(-1, "помню")]
+
+
 CHIME_TEXT = "Этот новый фильм про далёкий космос мне определённо понравился!"
 
 

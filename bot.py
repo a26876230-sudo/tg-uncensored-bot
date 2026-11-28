@@ -548,8 +548,10 @@ class ChatBot:
         command = NORI_COMMAND.fullmatch(text)
         if command and (not command[1] or command[1].casefold() == username.casefold()):
             text = command[2]
-        address = self.name_pattern.match(text.casefold())
-        return text[address.end():].lstrip(" ,:") if address else text
+        address = re.match(rf"@{re.escape(username)}(?!\w)", text, re.IGNORECASE)
+        if not address:
+            address = self.name_pattern.match(text.casefold())
+        return text[address.end():].lstrip(" \t,:–—") if address else text
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = update.message
