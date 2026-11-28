@@ -1,5 +1,6 @@
 .git
 .env*
+.nori/
 .venv
 .pytest_cache
 **/__pycache__
