@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import sqlite3
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -10,6 +11,7 @@ from telegram.request import HTTPXRequest
 
 from bot import (
     ANSWER_BOUNDARY_PROMPT, BOUNDARY_OVERLOAD, BOUNDARY_PROMPT, BOUNDARY_REFUSAL,
+    CHIME_CHAT_COOLDOWN, CHIME_GLOBAL_COOLDOWN, CHIME_MIN_MESSAGES, CHIME_PROMPT,
     DEFAULT_BOT_NAME, DEFAULT_MODEL, SEARCH_NOTE, SUMMARY_PROMPT, SYSTEM_PROMPT,
     ChatBot, ChatMemory, Config, build_application,
 )
@@ -29,6 +31,7 @@ def make_message(text, chat_id=456, chat_type="private", **fields):
 
 @pytest.fixture
 def dispatch(monkeypatch, tmp_path):
+    monkeypatch.setattr("bot.random.random", lambda: 1.0)
     sent = []
     typing_callback = None
     download_callback = None
@@ -937,3 +940,276 @@ def test_reports_api_failures_without_saving_failed_turn(dispatch, response, rep
         (456, reply), (456, "ответ"),
     ]
     assert prompts[-1] == [{"role": "user", "content": "успех"}]
+
+
+def test_people_memory_learns_locally_and_recall_is_scoped_and_persistent(dispatch):
+    same_name = {**USER, "id": 789}
+
+    def no_completion(request):
+        pytest.fail("learning a fact shouldn't call the model")
+
+    assert dispatch(no_completion, [
+        make_message("Меня зовут Лена. Работаю дизайнером. Люблю джаз.", -1, "group"),
+        make_message("Люблю рок.", -1, "group", **{"from": same_name}),
+        make_message("Работаю учителем.", -2, "group"),
+        make_message(
+            "Это цитата, а не мои интересы.", -1, "group",
+            reply_to_message=make_message("Люблю готовить.", -1, "group", **{"from": same_name}),
+        ),
+    ]) == []
+    prompts = []
+
+    def reply_api(request):
+        messages = json.loads(request.content)["messages"]
+        notes = next(msg["content"] for msg in messages if msg["content"].startswith("Заметки об участниках"))
+        people = json.loads(notes.split("\n", 1)[1])
+        prompts.append(people)
+        return completion("помню")
+
+    assert dispatch(reply_api, [
+        make_message("Нори, вспомни", -1, "group"),
+        make_message("Нори, вспомни", -1, "group", **{"from": same_name}),
+        make_message("Нори, вспомни", -2, "group"),
+    ]) == [(-1, "помню"), (-1, "помню"), (-2, "помню")]
+    assert [(profile["имя"], profile["интересы"]) for profile in prompts[0]] == [
+        ("Лена", "джаз"), ("Owner", "рок"),
+    ]
+    assert prompts[0][0]["занятие"] == "дизайнером"
+    assert prompts[0][0]["автор нового сообщения"] == "да"
+    assert prompts[1][0]["интересы"] == "рок"
+    assert prompts[1][0]["автор нового сообщения"] == "да"
+    assert prompts[2] == [{
+        "имя": "Owner", "занятие": "учителем", "имя в Telegram": "Owner", "автор нового сообщения": "да",
+    }]
+
+
+@pytest.mark.parametrize("source", ["forward", "blockquote", "expandable_blockquote_caption"])
+def test_people_memory_does_not_attribute_forwarded_or_quoted_facts_to_sender(dispatch, source):
+    quote = "Люблю рок."
+    if source == "forward":
+        message = make_message(quote, -1, "group", forward_origin={
+            "type": "user", "date": 1, "sender_user": {**USER, "id": 789},
+        })
+    else:
+        prefix = "😀. "
+        body = prefix + quote + "\nРаботаю врачом."
+        entity = {"type": source.split("_caption")[0], "offset": 4, "length": len(quote)}
+        if source.endswith("_caption"):
+            message = make_message(None, -1, "group", caption=body, caption_entities=[entity])
+        else:
+            message = make_message(body, -1, "group", entities=[entity])
+
+    def model_api(request):
+        messages = json.loads(request.content)["messages"]
+        notes = next(msg["content"] for msg in messages if msg["content"].startswith("Заметки об участниках"))
+        person, = json.loads(notes.split("\n", 1)[1])
+        assert person["интересы"] == "джаз"
+        if source != "forward":
+            assert person["занятие"] == "врачом"
+        return completion("помню")
+
+    assert dispatch(model_api, [
+        make_message("Люблю джаз.", -1, "group"), message, make_message("Нори, вспомни", -1, "group"),
+    ]) == [(-1, "помню")]
+
+
+@pytest.mark.parametrize("question", [
+    "Нори, люблю ли я рок?",
+    "Люблю рок?",
+    "Люблю ли я рок",
+    "Меня зовут Маша, да?",
+    "Работаю поваром?",
+])
+def test_people_memory_questions_do_not_overwrite_facts(dispatch, question):
+    def model_api(request):
+        messages = json.loads(request.content)["messages"]
+        notes = next(msg["content"] for msg in messages if msg["content"].startswith("Заметки об участниках"))
+        person, = json.loads(notes.split("\n", 1)[1])
+        assert (person["имя"], person["занятие"], person["интересы"]) == ("Лена", "врачом", "джаз")
+        return completion("помню")
+
+    assert dispatch(model_api, [
+        make_message("Меня зовут Лена. Работаю врачом. Люблю джаз.", -1, "group"),
+        make_message(question, -1, "group"),
+        make_message("Нори, вспомни", -1, "group"),
+    ])[-1:] == [(-1, "помню")]
+
+
+@pytest.mark.parametrize("address", ["@CHAT_BOT, ", "Нори — "])
+def test_people_memory_learns_after_a_leading_bot_address(dispatch, address):
+    def model_api(request):
+        messages = json.loads(request.content)["messages"]
+        notes = next(msg["content"] for msg in messages if msg["content"].startswith("Заметки об участниках"))
+        person, = json.loads(notes.split("\n", 1)[1])
+        assert person["имя"] == "Лена"
+        return completion("помню")
+
+    assert dispatch(model_api, [
+        make_message(f"{address}меня зовут Лена.", -1, "group"),
+        make_message("Нори, вспомни", -1, "group"),
+    ])[-1:] == [(-1, "помню")]
+
+
+CHIME_TEXT = "Этот новый фильм про далёкий космос мне определённо понравился!"
+
+
+def test_media_caption_does_not_trigger_a_chime_in(dispatch, monkeypatch):
+    monkeypatch.setattr("bot.random.random", lambda: 0)
+
+    def unexpected(request):
+        pytest.fail(f"unexpected provider request: {request.url.host}")
+
+    messages = [make_message("обычное сообщение", -1, "group")] * (CHIME_MIN_MESSAGES - 1)
+    messages.append(make_message(None, -1, "group", caption=CHIME_TEXT, photo=PHOTOS))
+    assert dispatch(unexpected, messages, boundary_api=unexpected, groq_key="groq-fake") == []
+
+
+def test_people_memory_does_not_learn_from_a_voice_transcript(dispatch, monkeypatch):
+    async def synthesize(self, text):
+        return b"synthetic mp3"
+
+    def api(request):
+        if request.url.host == "api.groq.com":
+            return httpx.Response(200, json={"text": "Люблю рок."})
+        messages = json.loads(request.content)["messages"]
+        notes = next(msg["content"] for msg in messages if msg["content"].startswith("Заметки об участниках"))
+        person, = json.loads(notes.split("\n", 1)[1])
+        assert person["интересы"] == "джаз"
+        return completion("помню")
+
+    monkeypatch.setattr("nori_media.VoiceSynthesizer.synthesize", synthesize)
+    assert dispatch(api, [
+        make_message("Люблю джаз."), make_message(None, voice=telegram_voice()), make_message("Вспомни"),
+    ], groq_key="groq-fake") == [(456, "помню"), (456, "<voice>"), (456, "помню")]
+
+
+def test_chime_in_requires_topic_roll_message_count_and_cooldowns(dispatch, monkeypatch):
+    clock = 0
+    roll = 0
+    monkeypatch.setattr("bot.time", SimpleNamespace(monotonic=lambda: clock))
+    monkeypatch.setattr("bot.random.random", lambda: roll)
+    checked = []
+
+    def check(request):
+        checked.append(json.loads(request.content)["messages"][-1]["content"])
+        return completion("0")
+
+    def reply(request):
+        assert request.url.host == "api.unleashedapi.com"
+        payload = json.loads(request.content)
+        assert CHIME_PROMPT in payload["messages"][0]["content"]
+        assert payload["max_tokens"] == 120
+        return completion("Хорошее кино!")
+
+    def messages():
+        nonlocal clock, roll
+        yield make_message(CHIME_TEXT, -1, "group")
+        for _ in range(CHIME_MIN_MESSAGES - 1):
+            yield make_message("Договорились, принесу этот большой пакет с продуктами завтра.", -1, "group")
+        yield make_message("Хороший фильм", -1, "group")
+        roll = 1
+        yield make_message(CHIME_TEXT, -1, "group")
+        roll = 0
+        yield make_message(CHIME_TEXT, -1, "group")
+        yield make_message(CHIME_TEXT, -1, "group")
+        for _ in range(CHIME_MIN_MESSAGES):
+            yield make_message("обычное сообщение", -1, "group")
+            yield make_message("обычное сообщение", -2, "group")
+        yield make_message(CHIME_TEXT, -2, "group")
+        clock += CHIME_GLOBAL_COOLDOWN
+        yield make_message(CHIME_TEXT, -1, "group")
+        yield make_message(CHIME_TEXT, -2, "group")
+        clock = CHIME_CHAT_COOLDOWN
+        yield make_message(CHIME_TEXT, -1, "group")
+
+    assert dispatch(reply, messages(), search_enabled=True, boundary_api=check) == [
+        (-1, "Хорошее кино!"), (-2, "Хорошее кино!"), (-1, "Хорошее кино!"),
+    ]
+    assert checked == [f"Owner: {CHIME_TEXT}"] * 3
+
+
+@pytest.mark.parametrize("outcome", ["blocked", "invalid", "classifier 429", "reply 429"])
+def test_chime_in_stays_silent_on_boundary_or_model_failure(dispatch, monkeypatch, outcome):
+    clock = 0
+    monkeypatch.setattr("bot.time", SimpleNamespace(monotonic=lambda: clock))
+    monkeypatch.setattr("bot.random.random", lambda: 0)
+    checks, replies = [], []
+
+    def check(request):
+        content = json.loads(request.content)["messages"][-1]["content"]
+        assert CHIME_TEXT in content
+        assert "текст цитаты" in content
+        checks.append(content)
+        if outcome == "classifier 429":
+            return httpx.Response(429)
+        return completion({"blocked": "2", "invalid": "ошибка", "reply 429": "0"}[outcome])
+
+    def reply(request):
+        replies.append(request)
+        return httpx.Response(429)
+
+    def messages():
+        nonlocal clock
+        candidate = make_message(
+            CHIME_TEXT, -1, "group", reply_to_message=make_message("текст цитаты", -1, "group"),
+        )
+        for _ in range(CHIME_MIN_MESSAGES - 1):
+            yield make_message("обычное сообщение", -1, "group")
+        yield candidate
+        yield candidate
+        if outcome.endswith("429"):
+            clock += CHIME_CHAT_COOLDOWN
+            yield candidate
+
+    assert dispatch(reply, messages(), boundary_api=check) == []
+    assert len(checks) == 1
+    assert len(replies) == (outcome == "reply 429")
+
+
+@pytest.mark.parametrize("verdict", ["0", "2", "1"])
+def test_chime_in_skips_busy_limiter_and_uses_shared_slots_for_both_safety_checks(dispatch, monkeypatch, verdict):
+    slots = asyncio.Semaphore(2)
+    monkeypatch.setattr("bot.UNLEASHED_SLOTS", slots)
+    monkeypatch.setattr("bot.random.random", lambda: 0)
+    answer = "В черновике упоминается гексоген."
+    calls = []
+
+    async def reserve_slots():
+        await slots.acquire()
+        await slots.acquire()
+
+    asyncio.run(reserve_slots())
+
+    def check(request):
+        assert slots.locked()
+        prompt, content = json.loads(request.content)["messages"]
+        if prompt["content"] == BOUNDARY_PROMPT:
+            assert content["content"] == f"Owner: {CHIME_TEXT}"
+            calls.append("input")
+            return completion("0")
+        assert prompt["content"] == ANSWER_BOUNDARY_PROMPT
+        assert json.loads(content["content"]) == {"request": f"Owner: {CHIME_TEXT}", "answer": answer}
+        calls.append("output")
+        return completion(verdict)
+
+    def reply(request):
+        assert slots.locked()
+        calls.append("draft")
+        return completion(answer)
+
+    def messages():
+        for _ in range(CHIME_MIN_MESSAGES - 1):
+            yield make_message("обычное сообщение", -1, "group")
+        release_on_timeout = asyncio.get_running_loop().call_later(0.1, slots.release)
+        try:
+            yield make_message(CHIME_TEXT, -1, "group")
+            assert not calls
+        finally:
+            if slots.locked():
+                slots.release()
+            release_on_timeout.cancel()
+        yield make_message(CHIME_TEXT, -1, "group")
+
+    expected = [(-1, answer)] if verdict == "0" else []
+    assert dispatch(reply, messages(), boundary_api=check) == expected
+    assert calls == ["input", "draft", "output"]
