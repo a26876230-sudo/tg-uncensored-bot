@@ -521,7 +521,9 @@ class ChatBot:
         if not isinstance(answer, str) or not answer.strip():
             raise ValueError("Пустой или некорректный ответ UnleashedAPI.")
         if mark_truncated and choice.get("finish_reason") == "length":
-            answer += " …"
+            last_code = next(reversed(list(REPLY_CODE.finditer(answer))), None)
+            if not (last_code and last_code["fence"] and not answer[last_code.end():].strip()):
+                answer = answer.rstrip() + " …"
         return answer if mark_truncated else answer.strip()
 
     async def classify_message(
