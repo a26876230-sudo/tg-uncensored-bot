@@ -3,6 +3,7 @@ import json
 import re
 import sqlite3
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -10,10 +11,10 @@ from telegram import Update
 from telegram.request import HTTPXRequest
 
 from bot import (
-    ANSWER_BOUNDARY_PROMPT, BOUNDARY_OVERLOAD, BOUNDARY_PROMPT, BOUNDARY_REFUSAL,
+    ANSWER_BOUNDARY_PROMPT, BOUNDARY_OVERLOAD, BOUNDARY_PROMPT, BOUNDARY_REFUSAL, BUBBLE_LIMIT,
     CHIME_CHAT_COOLDOWN, CHIME_GLOBAL_COOLDOWN, CHIME_MIN_MESSAGES, CHIME_PROMPT,
     DEFAULT_BOT_NAME, DEFAULT_MODEL, SEARCH_NOTE, SUMMARY_PROMPT, SYSTEM_PROMPT,
-    ChatBot, ChatMemory, Config, build_application,
+    ChatBot, ChatMemory, Config, TelegramReply, build_application, parse_reply, pause_before_bubble,
 )
 from nori_media import VISION_MODEL
 
@@ -39,6 +40,10 @@ def dispatch(monkeypatch, tmp_path):
         "voice-file": b"OggS synthetic voice",
         "large-photo": b"synthetic image",
     }
+    effects = []
+    reject_effects = False
+    sticker = {"file_id": "cat-laugh", "file_unique_id": "cat", "type": "regular",
+               "width": 512, "height": 512, "is_animated": False, "is_video": False, "emoji": "😹"}
 
     async def telegram_api(self, url, method, request_data=None, **kwargs):
         endpoint = url.rsplit("/", 1)[-1]
@@ -53,6 +58,7 @@ def dispatch(monkeypatch, tmp_path):
             params = request_data.parameters
             assert params["link_preview_options"] == {"is_disabled": True}
             sent.append((params["chat_id"], params["text"]))
+            effects.append((endpoint, params["text"]))
             result = make_message(params["text"], params["chat_id"], **{"from": BOT})
         elif endpoint == "getFile":
             file_id = request_data.parameters["file_id"]
@@ -67,25 +73,47 @@ def dispatch(monkeypatch, tmp_path):
             assert upload[:2] == ("nori.mp3", b"synthetic mp3")
             sent.append((params["chat_id"], "<voice>"))
             result = make_message("", params["chat_id"], **{"from": BOT})
+        elif endpoint == "setMessageReaction":
+            params = request_data.parameters
+            effects.append((endpoint, params["chat_id"], params["message_id"], params["reaction"]))
+            result = True
+        elif endpoint == "getStickerSet":
+            name = request_data.parameters["name"]
+            effects.append((endpoint, name))
+            result = {"name": name, "title": "Cats", "sticker_type": "regular", "stickers": [sticker]}
+        elif endpoint == "sendSticker":
+            params = request_data.parameters
+            effects.append((endpoint, params["chat_id"], params["sticker"]))
+            result = make_message(None, params["chat_id"], sticker=sticker, **{"from": BOT})
         else:
             pytest.fail(f"unexpected Telegram call: {endpoint}")
+        if reject_effects and endpoint in {"setMessageReaction", "sendSticker"}:
+            return 400, json.dumps({"ok": False, "description": "Not allowed"}).encode()
         return 200, json.dumps({"ok": True, "result": result}).encode()
 
     monkeypatch.setattr(HTTPXRequest, "do_request", telegram_api)
 
+    async def skip_pause(text):
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr("bot.pause_before_bubble", skip_pause)
+
     def run(
         model_api, messages, model=DEFAULT_MODEL, *, search_enabled=False, keenable_key="", name=DEFAULT_BOT_NAME,
         on_typing=None, boundary_api=None, groq_key="", on_download=None,
+        observed=None, reject=False, sticker_set="Cats",
     ):
-        nonlocal typing_callback, download_callback
+        nonlocal typing_callback, download_callback, effects, reject_effects
         typing_callback = on_typing
         download_callback = on_download
+        effects = observed if observed is not None else []
+        reject_effects = reject
         sent.clear()
 
         async def process():
             config = Config(
                 "123:fake", "ulk-fake", model, search_enabled, keenable_key, name,
-                tmp_path / "chat.sqlite3", groq_key=groq_key,
+                tmp_path / "chat.sqlite3", groq_key=groq_key, sticker_set=sticker_set,
             )
             model_transport = httpx.MockTransport(model_api)
             boundary_transport = httpx.MockTransport(boundary_api or (lambda request: completion("НЕТ ПРОСТО")))
@@ -123,6 +151,7 @@ def test_config_uses_only_chat_token_and_allows_model_override(monkeypatch):
     monkeypatch.delenv("CHAT_BOT_DB", raising=False)
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     monkeypatch.delenv("CHAT_BOT_VISION_MODEL", raising=False)
+    monkeypatch.delenv("CHAT_BOT_STICKER_SET", raising=False)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:bridge")
     monkeypatch.setenv("UNLEASHED_API_KEY", "ulk-fake")
     with pytest.raises(ValueError, match="CHAT_BOT_TOKEN"):
@@ -370,7 +399,7 @@ def test_dispatches_only_private_or_addressed_group_messages(dispatch):
     ]
 
 
-def test_splits_reply_at_telegram_limit(dispatch):
+def test_caps_oversized_model_reply_at_three_short_bubbles(dispatch):
     prompts = []
     long_reply = "🙂" * 2049
 
@@ -379,10 +408,87 @@ def test_splits_reply_at_telegram_limit(dispatch):
         return completion(long_reply if len(prompts) == 8 else "ответ")
 
     replies = dispatch(model_api, [make_message(f"запрос {i}") for i in range(8)])
-    assert replies[-2:] == [(456, "🙂" * 2048), (456, "🙂")]
+    assert replies[-3:] == [
+        (456, "🙂" * BUBBLE_LIMIT), (456, "🙂" * BUBBLE_LIMIT), (456, "🙂" * (BUBBLE_LIMIT - 1) + "…"),
+    ]
     assert [message["content"] for message in prompts[-1] if message["role"] == "user"] == [
         f"запрос {i}" for i in range(8)
     ]
+
+
+@pytest.mark.parametrize(("raw", "reply"), [
+    ("ага [NEXT]\n так и есть", TelegramReply(("ага", "так и есть"))),
+    ("один\n\nдва\n\nтри\n\nчетыре", TelegramReply(("один", "два", "три…"))),
+    ("`[[ ReAcTiOn: ❤ ]]`", TelegramReply(("❤️",), reaction="❤️")),
+    ("важный ответ [reaction:👍]", TelegramReply(("важный ответ",))),
+    ("[reaction:🙃]\nтекст", TelegramReply(("текст",))),
+    ("[sticker:broken\nтекст", TelegramReply(("текст",))),
+    ("[sticker]\nтекст", TelegramReply(("текст",))),
+    ("[sticker: LAUGH]\nхаха", TelegramReply(("хаха",), sticker_mood="laugh")),
+])
+def test_parse_telegram_reply(raw, reply):
+    assert parse_reply(raw) == reply
+
+
+def test_typing_pause_grows_with_text_and_is_bounded(monkeypatch):
+    sleep = AsyncMock()
+    monkeypatch.setattr("bot.asyncio.sleep", sleep)
+
+    async def check():
+        for size in (1, 90, BUBBLE_LIMIT, BUBBLE_LIMIT * 2):
+            await pause_before_bubble("а" * size)
+
+    asyncio.run(check())
+    short, medium, long, capped = (call.args[0] for call in sleep.await_args_list)
+    assert 0 < short < medium < long == capped < 4
+
+
+def test_each_bubble_has_typing_and_only_sent_text_goes_to_history(dispatch):
+    events = []
+    prompts = []
+
+    def model_api(request):
+        prompts.append(json.loads(request.content)["messages"])
+        return completion("ага [next] так и есть" if len(prompts) == 1 else "точно")
+
+    assert dispatch(model_api, [make_message("да?"), make_message("правда?")],
+                    on_typing=lambda: events.append(("typing",)), observed=events) == [
+        (456, "ага"), (456, "так и есть"), (456, "точно"),
+    ]
+    for index, event in enumerate(events):
+        if event[0] == "sendMessage":
+            assert index > 0 and events[index - 1] == ("typing",)
+    assert {"role": "assistant", "content": "ага\n\nтак и есть"} in prompts[1]
+
+
+def test_reacts_without_sending_text(dispatch):
+    events = []
+    assert dispatch(lambda request: completion("[reaction:👍]"), [make_message("спасибо")],
+                    observed=events) == []
+    assert events == [("setMessageReaction", 456, 42, [{"emoji": "👍", "type": "emoji"}])]
+
+
+def test_sends_mood_matched_stickers_and_caches_pack(dispatch):
+    events = []
+    assert dispatch(lambda request: completion("[sticker:laugh]\nахаха"),
+                    [make_message("шутка")] * 2, observed=events) == []
+    assert events == [("getStickerSet", "Cats"), ("sendSticker", 456, "cat-laugh"), ("sendSticker", 456, "cat-laugh")]
+
+
+@pytest.mark.parametrize(("raw", "text"), [
+    ("[reaction:👍]", "👍"),
+    ("[sticker:laugh]\nахаха", "ахаха"),
+    ("[sticker:celebrate]\nура!", "ура!"),
+])
+def test_rejected_or_unmatched_telegram_effect_falls_back_to_text(dispatch, raw, text):
+    assert dispatch(lambda request: completion(raw), [make_message("шутка")], reject=True) == [(456, text)]
+
+
+def test_disabled_stickers_fall_back_without_fetching_pack(dispatch):
+    events = []
+    assert dispatch(lambda request: completion("[sticker:laugh]\nахаха"),
+                    [make_message("шутка")], sticker_set="", observed=events) == [(456, "ахаха")]
+    assert events == [("sendMessage", "ахаха")]
 
 
 def test_accepts_anonymous_admin_but_ignores_a_bot(dispatch):
