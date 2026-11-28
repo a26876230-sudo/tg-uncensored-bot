@@ -80,7 +80,7 @@ STICKER_MOODS = {
 }
 FENCED_CODE = (
     r"^ {0,3}(?P<fence>(?P<fence_char>[`~])(?P=fence_char){2,})[^\n]*\n"
-    r"[\s\S]*?(?:^ {0,3}(?P=fence)(?P=fence_char)*[ \t]*(?=\r?$)|\Z)"
+    r"[\s\S]*?(?:(?P<closing_fence>^ {0,3}(?P=fence)(?P=fence_char)*[ \t]*(?=\r?$))|\Z)"
 )
 REPLY_CODE = re.compile(
     FENCED_CODE + r"|(?<!`)(?P<ticks>`+)(?!`)[\s\S]*?(?<!`)(?P=ticks)(?!`)", re.MULTILINE,
@@ -528,8 +528,16 @@ class ChatBot:
         if not isinstance(answer, str) or not answer.strip():
             raise ValueError("Пустой или некорректный ответ UnleashedAPI.")
         if mark_truncated and choice.get("finish_reason") == "length":
-            last_code = next(reversed(list(REPLY_CODE.finditer(answer))), None)
-            if not (last_code and last_code["fence"] and not answer[last_code.end():].strip()):
+            last_code = None
+            for last_code in REPLY_CODE.finditer(answer):
+                pass
+            if last_code and last_code["fence"] and not answer[last_code.end():].strip():
+                if last_code["closing_fence"] is None:
+                    if not answer.endswith("\n"):
+                        answer += "\n"
+                    answer += last_code["fence"]
+                answer += "\n\n…"
+            else:
                 answer = answer.rstrip() + " …"
         return answer if mark_truncated else answer.strip()
 

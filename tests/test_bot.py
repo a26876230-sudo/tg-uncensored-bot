@@ -1058,6 +1058,18 @@ def test_marks_replies_truncated_by_token_limit(dispatch, finish_reason, expecte
     assert dispatch(model_api, [make_message("вопрос")]) == [(456, expected)]
 
 
+@pytest.mark.parametrize("fence", ["```", "~~~~"])
+def test_closes_truncated_fence_before_notifying_user(dispatch, fence):
+    answer = f"{fence}py\n    unfinished_call(  "
+
+    def model_api(request):
+        return httpx.Response(200, json={"choices": [{
+            "message": {"content": answer}, "finish_reason": "length",
+        }]})
+
+    assert dispatch(model_api, [make_message("покажи код")]) == [(456, f"{answer}\n{fence}"), (456, "…")]
+
+
 @pytest.mark.parametrize(
     ("response", "reply"),
     [
