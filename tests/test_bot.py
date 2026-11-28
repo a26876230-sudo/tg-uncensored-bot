@@ -13,6 +13,7 @@ from bot import (
     DEFAULT_BOT_NAME, DEFAULT_MODEL, SEARCH_NOTE, SUMMARY_PROMPT, SYSTEM_PROMPT,
     ChatBot, ChatMemory, Config, build_application,
 )
+from nori_media import VISION_MODEL
 
 
 BOT = {"id": 123, "is_bot": True, "first_name": "Chat", "username": "chat_bot"}
@@ -30,6 +31,11 @@ def make_message(text, chat_id=456, chat_type="private", **fields):
 def dispatch(monkeypatch, tmp_path):
     sent = []
     typing_callback = None
+    download_callback = None
+    telegram_downloads = {
+        "voice-file": b"OggS synthetic voice",
+        "large-photo": b"synthetic image",
+    }
 
     async def telegram_api(self, url, method, request_data=None, **kwargs):
         endpoint = url.rsplit("/", 1)[-1]
@@ -45,6 +51,19 @@ def dispatch(monkeypatch, tmp_path):
             assert params["link_preview_options"] == {"is_disabled": True}
             sent.append((params["chat_id"], params["text"]))
             result = make_message(params["text"], params["chat_id"], **{"from": BOT})
+        elif endpoint == "getFile":
+            file_id = request_data.parameters["file_id"]
+            if download_callback:
+                download_callback(file_id)
+            result = {"file_id": file_id, "file_unique_id": file_id, "file_path": file_id}
+        elif endpoint in telegram_downloads:
+            return 200, telegram_downloads[endpoint]
+        elif endpoint == "sendVoice":
+            params = request_data.parameters
+            upload = request_data.multipart_data["voice"]
+            assert upload[:2] == ("nori.mp3", b"synthetic mp3")
+            sent.append((params["chat_id"], "<voice>"))
+            result = make_message("", params["chat_id"], **{"from": BOT})
         else:
             pytest.fail(f"unexpected Telegram call: {endpoint}")
         return 200, json.dumps({"ok": True, "result": result}).encode()
@@ -53,14 +72,18 @@ def dispatch(monkeypatch, tmp_path):
 
     def run(
         model_api, messages, model=DEFAULT_MODEL, *, search_enabled=False, keenable_key="", name=DEFAULT_BOT_NAME,
-        on_typing=None, boundary_api=None,
+        on_typing=None, boundary_api=None, groq_key="", on_download=None,
     ):
-        nonlocal typing_callback
+        nonlocal typing_callback, download_callback
         typing_callback = on_typing
+        download_callback = on_download
         sent.clear()
 
         async def process():
-            config = Config("123:fake", "ulk-fake", model, search_enabled, keenable_key, name, tmp_path / "chat.sqlite3")
+            config = Config(
+                "123:fake", "ulk-fake", model, search_enabled, keenable_key, name,
+                tmp_path / "chat.sqlite3", groq_key=groq_key,
+            )
             model_transport = httpx.MockTransport(model_api)
             boundary_transport = httpx.MockTransport(boundary_api or (lambda request: completion("НЕТ ПРОСТО")))
 
@@ -95,6 +118,8 @@ def test_config_uses_only_chat_token_and_allows_model_override(monkeypatch):
     monkeypatch.delenv("KEENABLE_API_KEY", raising=False)
     monkeypatch.delenv("CHAT_BOT_NAME", raising=False)
     monkeypatch.delenv("CHAT_BOT_DB", raising=False)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("CHAT_BOT_VISION_MODEL", raising=False)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:bridge")
     monkeypatch.setenv("UNLEASHED_API_KEY", "ulk-fake")
     with pytest.raises(ValueError, match="CHAT_BOT_TOKEN"):
@@ -108,6 +133,183 @@ def test_config_uses_only_chat_token_and_allows_model_override(monkeypatch):
     assert Config.from_env().model == "other-model"
     monkeypatch.setenv("CHAT_BOT_NAME", " Луна ")
     assert Config.from_env().name == "Луна"
+    monkeypatch.setenv("GROQ_API_KEY", " groq-fake ")
+    monkeypatch.setenv("CHAT_BOT_VISION_MODEL", " vision-model ")
+    assert Config.from_env().groq_key == "groq-fake"
+    assert Config.from_env().vision_model == "vision-model"
+
+
+def telegram_voice(duration=3):
+    return {"file_id": "voice-file", "file_unique_id": "voice", "duration": duration}
+
+
+PHOTOS = [
+    {"file_id": "small-photo", "file_unique_id": "small", "width": 75, "height": 75},
+    {"file_id": "large-photo", "file_unique_id": "large", "width": 640, "height": 640},
+]
+
+
+def test_addressed_voice_is_transcribed_then_answered_with_telegram_voice(dispatch, monkeypatch):
+    requests = []
+    synthesized = []
+
+    async def synthesize(self, text):
+        synthesized.append(text)
+        return b"synthetic mp3"
+
+    def api(request):
+        requests.append(request.url.host)
+        if request.url.host == "api.groq.com":
+            assert request.url.path == "/openai/v1/audio/transcriptions"
+            assert request.headers["Authorization"] == "Bearer groq-fake"
+            assert b"OggS synthetic voice" in request.content
+            assert b"whisper-large-v3" in request.content
+            return httpx.Response(200, json={"text": "Сколько будет два плюс два?"})
+        assert "Сколько будет два плюс два?" in json.loads(request.content)["messages"][-1]["content"]
+        return completion("Четыре.")
+
+    monkeypatch.setattr("nori_media.VoiceSynthesizer.synthesize", synthesize)
+    replies = dispatch(
+        api, [make_message(None, voice=telegram_voice())], groq_key="groq-fake", search_enabled=True,
+    )
+    assert replies == [(456, "<voice>")]
+    assert requests == ["api.groq.com", "api.unleashedapi.com"]
+    assert synthesized == ["Четыре."]
+
+
+def test_reply_to_noris_voice_follows_the_normal_text_search_path(dispatch):
+    searches = []
+
+    def api(request):
+        if request.url.host == "api.keenable.ai":
+            searches.append(json.loads(request.content)["query"])
+            return httpx.Response(200, json={"results": []})
+        return completion("Ответ с поиском.")
+
+    assert dispatch(api, [
+        make_message(
+            "Какая погода сейчас?", -1, "group",
+            reply_to_message=make_message(None, -1, "group", voice=telegram_voice(), **{"from": BOT}),
+        ),
+    ], search_enabled=True, on_download=lambda _: pytest.fail("не скачивай голосовое Нори")) == [
+        (-1, "Ответ с поиском."),
+    ]
+    assert searches == ["Какая погода сейчас?"]
+
+
+def test_group_photo_is_understood_only_when_addressed_or_quoted(dispatch):
+    downloads = []
+    prompts = []
+    caption = "Нори, что за мем?"
+    photo = make_message(None, -1, "group", photo=PHOTOS)
+
+    def api(request):
+        payload = json.loads(request.content)
+        if request.url.host == "api.groq.com":
+            assert request.url.path == "/openai/v1/chat/completions"
+            assert payload["model"] == VISION_MODEL
+            assert payload["messages"][0]["content"][1] == {
+                "type": "image_url", "image_url": {"url": "data:image/jpeg;base64,c3ludGhldGljIGltYWdl"},
+            }
+            return completion('Кот с подписью «понедельник».')
+        prompts.append(payload["messages"])
+        return completion("Это мем про понедельник.")
+
+    replies = dispatch(api, [
+        photo,
+        make_message(None, -1, "group", voice=telegram_voice()),
+        make_message(None, -1, "group", photo=PHOTOS, caption=caption),
+        make_message("Нори, объясни", -1, "group", reply_to_message=photo),
+        make_message("Нори, привет", -1, "group"),
+    ], groq_key="groq-fake", on_download=downloads.append)
+    assert replies == [(-1, "Это мем про понедельник.")] * 3
+    assert downloads == ["large-photo", "large-photo"]
+    assert caption in prompts[0][-1]["content"]
+    assert all("Кот с подписью" in prompt[-1]["content"] for prompt in prompts[:2])
+    assert all("Кот с подписью" not in message["content"] for message in prompts[-1])
+
+
+def test_large_voice_is_rejected_without_download_or_model_call(dispatch):
+    def unexpected(request):
+        pytest.fail(f"unexpected provider request: {request.url}")
+
+    assert dispatch(
+        unexpected, [make_message(None, voice=telegram_voice(duration=181))], groq_key="groq-fake",
+        on_download=lambda file_id: pytest.fail("voice must not be downloaded"),
+    ) == [(456, "Голосовое слишком длинное. Пришлите до трёх минут.")]
+
+
+def test_voice_command_falls_back_to_text_if_synthesis_fails(dispatch, monkeypatch):
+    async def synthesize(self, answer):
+        assert answer == "Текстовый ответ"
+        raise RuntimeError("synthetic failure")
+
+    monkeypatch.setattr("nori_media.VoiceSynthesizer.synthesize", synthesize)
+    assert dispatch(
+        lambda request: completion("Текстовый ответ"),
+        [make_message("/voice@CHAT_BOT привет", -1, "group")],
+    ) == [(-1, "Текстовый ответ")]
+
+
+def test_blocked_voice_command_does_not_synthesize(dispatch, monkeypatch):
+    async def synthesize(self, answer):
+        pytest.fail("voice must not be synthesized")
+
+    monkeypatch.setattr("nori_media.VoiceSynthesizer.synthesize", synthesize)
+    assert dispatch(
+        lambda request: completion("Черновик не должен быть отправлен"),
+        [make_message("/voice запрос о фишинге")], boundary_api=lambda request: completion("2"),
+    ) == [(456, BOUNDARY_REFUSAL)]
+
+
+def test_voice_transcript_reaches_boundary_check_without_a_local_match(dispatch, monkeypatch):
+    transcript = "Подскажи, как достать чужой пароль."
+
+    async def synthesize(self, answer):
+        pytest.fail("voice must not be synthesized")
+
+    def api(request):
+        assert request.url.host == "api.groq.com"
+        return httpx.Response(200, json={"text": transcript})
+
+    def boundary_api(request):
+        messages = json.loads(request.content)["messages"]
+        assert messages[0]["content"] == BOUNDARY_PROMPT
+        assert transcript in messages[-1]["content"]
+        return completion("2")
+
+    monkeypatch.setattr("nori_media.VoiceSynthesizer.synthesize", synthesize)
+    assert dispatch(
+        api, [make_message(None, voice=telegram_voice())], groq_key="groq-fake", search_enabled=True,
+        boundary_api=boundary_api,
+    ) == [(456, BOUNDARY_REFUSAL)]
+
+
+def test_photo_answer_is_checked_before_speaking_without_a_local_match(dispatch, monkeypatch):
+    def api(request):
+        if request.url.host == "api.groq.com":
+            return completion("На фото кот.")
+        assert request.url.host == "api.unleashedapi.com"
+        return completion("Черновик не прошёл проверку.")
+
+    def boundary_api(request):
+        messages = json.loads(request.content)["messages"]
+        if messages[0]["content"] == BOUNDARY_PROMPT:
+            return completion("0")
+        assert messages[0]["content"] == ANSWER_BOUNDARY_PROMPT
+        payload = json.loads(messages[-1]["content"])
+        assert "На фото кот." in payload["request"]
+        assert payload["answer"] == "Черновик не прошёл проверку."
+        return httpx.Response(429)
+
+    async def synthesize(self, answer):
+        pytest.fail("unchecked answers must not be synthesized")
+
+    monkeypatch.setattr("nori_media.VoiceSynthesizer.synthesize", synthesize)
+    assert dispatch(
+        api, [make_message(None, photo=PHOTOS, caption="/voice Что на фото?")],
+        groq_key="groq-fake", search_enabled=True, boundary_api=boundary_api,
+    ) == [(456, BOUNDARY_OVERLOAD)]
 
 
 def test_search_settings_from_env(monkeypatch):

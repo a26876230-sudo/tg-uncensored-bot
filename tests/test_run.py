@@ -150,7 +150,7 @@ def test_supervisor_restarts_only_the_failed_child(fake_app, crashed_child):
 
 def test_supervisor_does_not_restart_chatbot_without_a_key(fake_app):
     root = Path(__file__).resolve().parents[1]
-    for name in ("bot.py", "telegram_common.py"):
+    for name in ("bot.py", "nori_media.py", "telegram_common.py"):
         shutil.copyfile(root / name, fake_app / name)
     result = subprocess.run(
         [sys.executable, "-c", "import run; run.INITIAL_DELAY = 0.05; raise SystemExit(run.main())"],
