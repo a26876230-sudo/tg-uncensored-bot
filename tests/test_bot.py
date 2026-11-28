@@ -454,6 +454,16 @@ def test_search_failures_still_answer_without_sources(dispatch, failure):
     assert dispatch(api, [make_message("вопрос")], search_enabled=True) == [(456, "ответ без поиска")]
 
 
+@pytest.mark.parametrize(("finish_reason", "expected"), [("length", "Ответ …"), ("stop", "Ответ")])
+def test_marks_replies_truncated_by_token_limit(dispatch, finish_reason, expected):
+    def model_api(request):
+        return httpx.Response(200, json={"choices": [{
+            "message": {"content": "Ответ "}, "finish_reason": finish_reason,
+        }]})
+
+    assert dispatch(model_api, [make_message("вопрос")]) == [(456, expected)]
+
+
 @pytest.mark.parametrize(
     ("response", "reply"),
     [

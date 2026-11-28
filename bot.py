@@ -180,7 +180,9 @@ class ChatBot:
                 break
         return sources
 
-    async def request_completion(self, messages: list[dict[str, str]], **options) -> str:
+    async def request_completion(
+        self, messages: list[dict[str, str]], *, mark_truncated: bool = False, **options,
+    ) -> str:
         response = await self.http.post(
             f"{UNLEASHED_BASE_URL}chat/completions",
             headers={"Authorization": f"Bearer {self.config.api_key}"},
@@ -188,12 +190,16 @@ class ChatBot:
         )
         response.raise_for_status()
         try:
-            answer = response.json()["choices"][0]["message"]["content"]
+            choice = response.json()["choices"][0]
+            answer = choice["message"]["content"]
         except (ValueError, KeyError, IndexError, TypeError):
             answer = None
         if not isinstance(answer, str) or not answer.strip():
             raise ValueError("Пустой или некорректный ответ UnleashedAPI.")
-        return answer.strip()
+        answer = answer.strip()
+        if mark_truncated and choice.get("finish_reason") == "length":
+            answer += " …"
+        return answer
 
     async def complete(self, memory: ChatMemory, latest: dict[str, str], sources: list[dict[str, str]]) -> str:
         system_prompt = f"{SYSTEM_PROMPT}\nТебя зовут {self.config.name}."
@@ -210,7 +216,7 @@ class ChatBot:
             })
         options = {"reasoning_effort": "none"} if self.config.model == DEFAULT_MODEL else {}
         return await self.request_completion(
-            [*messages, *memory.recent, latest], max_tokens=REPLY_MAX_TOKENS, **options,
+            [*messages, *memory.recent, latest], mark_truncated=True, max_tokens=REPLY_MAX_TOKENS, **options,
         )
 
     async def remember(self, chat_id: int, memory: ChatMemory, *messages: dict[str, str]):
