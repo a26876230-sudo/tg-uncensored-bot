@@ -294,6 +294,28 @@ def test_blocked_voice_command_does_not_synthesize(dispatch, monkeypatch):
     ) == [(456, BOUNDARY_REFUSAL)]
 
 
+@pytest.mark.parametrize("synthesis_ok", [True, False])
+def test_voice_reply_never_speaks_or_sends_delivery_markers(dispatch, monkeypatch, synthesis_ok):
+    prompts = []
+
+    async def synthesize(self, answer):
+        assert answer == "Вот что нашла.\n\nДальше можно уточнить."
+        if not synthesis_ok:
+            raise RuntimeError("synthetic failure")
+        return b"synthetic mp3"
+
+    def model_api(request):
+        prompts.append(json.loads(request.content)["messages"])
+        return completion("Вот что нашла. [next] Дальше можно уточнить. [sticker:love]")
+
+    monkeypatch.setattr("nori_media.VoiceSynthesizer.synthesize", synthesize)
+    replies = dispatch(model_api, [make_message("/voice расскажи"), make_message("ещё?")])
+    voice_response = [(456, "<voice>")] if synthesis_ok else [(456, "Вот что нашла."), (456, "Дальше можно уточнить.")]
+    assert replies == voice_response + [(456, "Вот что нашла."), (456, "Дальше можно уточнить.")]
+    assert "Этот ответ будет озвучен" in prompts[0][0]["content"]
+    assert {"role": "assistant", "content": "Вот что нашла.\n\nДальше можно уточнить."} in prompts[1]
+
+
 def test_voice_transcript_reaches_boundary_check_without_a_local_match(dispatch, monkeypatch):
     transcript = "Подскажи, как достать чужой пароль."
 
@@ -1275,6 +1297,19 @@ def test_chime_in_requires_topic_roll_message_count_and_cooldowns(dispatch, monk
         (-1, "Хорошее кино!"), (-2, "Хорошее кино!"), (-1, "Хорошее кино!"),
     ]
     assert checked == [f"Owner: {CHIME_TEXT}"] * 3
+
+
+def test_chime_in_uses_same_bubbles_without_replying_to_other_messages(dispatch, monkeypatch):
+    monkeypatch.setattr("bot.random.random", lambda: 0)
+    messages = [make_message("обычное сообщение", -1, "group")] * (CHIME_MIN_MESSAGES - 1)
+    messages.append(make_message(CHIME_TEXT, -1, "group"))
+    messages.append(make_message(CHIME_TEXT, -1, "group"))
+
+    def reply(request):
+        assert CHIME_PROMPT in json.loads(request.content)["messages"][0]["content"]
+        return completion("Хорошее кино! [next] Концовка особенно.")
+
+    assert dispatch(reply, messages) == [(-1, "Хорошее кино!"), (-1, "Концовка особенно.")]
 
 
 @pytest.mark.parametrize("outcome", ["blocked", "invalid", "classifier 429", "reply 429"])

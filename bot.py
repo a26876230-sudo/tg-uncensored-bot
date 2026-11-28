@@ -572,11 +572,13 @@ class ChatBot:
 
     async def complete(
         self, memory: ChatMemory, latest: dict[str, str], sources: list[dict[str, str]], *, reasoning: bool = False,
-        people: list[dict[str, str]] | None = None, spontaneous: bool = False,
+        people: list[dict[str, str]] | None = None, spontaneous: bool = False, speak: bool = False,
     ) -> str:
         system_prompt = f"{SYSTEM_PROMPT}\nТебя зовут {self.config.name}."
         if spontaneous:
             system_prompt += f"\n{CHIME_PROMPT}"
+        if speak:
+            system_prompt += "\nЭтот ответ будет озвучен. Пиши обычный текст без маркеров, реакций и стикеров."
         if sources:
             system_prompt += f"\n{SEARCH_NOTE}"
             results = json.dumps(sources, ensure_ascii=False)
@@ -610,7 +612,7 @@ class ChatBot:
 
     async def generate_reply(
         self, memory: ChatMemory, latest: dict[str, str], query: str, username: str, quote: str | None, *,
-        people: list[dict[str, str]], spontaneous: bool, has_media: bool,
+        people: list[dict[str, str]], spontaneous: bool, has_media: bool, speak: bool,
     ) -> str | None:
         text = (f"{query}\n{quote}" if quote else query).casefold()
         if spontaneous or has_media or matches_signal_groups(text, BOUNDARY_SIGNALS):
@@ -626,6 +628,7 @@ class ChatBot:
         sources = await self.search(query) if not (has_media or spontaneous) and self.needs_search(query, username) else []
         answer = await self.complete(
             memory, latest, sources, reasoning=reasoning and not spontaneous, people=people, spontaneous=spontaneous,
+            speak=speak,
         )
         output = answer.casefold()
         if (has_media or matches_signal_groups(output, BOUNDARY_SIGNALS)
@@ -777,7 +780,7 @@ class ChatBot:
                 people = self.store.people(chat_id, user.id if user else None)
                 answer = await self.generate_reply(
                     memory, latest, query, context.bot.username, quote, people=people, spontaneous=spontaneous,
-                    has_media=media is not None,
+                    has_media=media is not None, speak=speak,
                 )
         except MediaError as exc:
             await message.reply_text(str(exc))
@@ -811,7 +814,7 @@ class ChatBot:
             if speak and not reply.reaction and answer != BOUNDARY_REFUSAL and await self.speech.try_reply(message, spoken):
                 sent = spoken
             else:
-                sent = await self.send_reply(message, reply)
+                sent = await self.send_reply(message, TelegramReply(reply.bubbles) if speak else reply)
             memory.messages_since_reply = 0
             saved = [remembered, {"role": "assistant", "content": sent}]
         finally:
