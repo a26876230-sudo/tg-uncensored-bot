@@ -23,8 +23,7 @@ DEFAULT_MODEL = "deepseek-v4.1-flash-abliterated"
 DEFAULT_BOT_NAME = "Нори"
 DEFAULT_DB_PATH = Path(".nori/chat-memory.sqlite3")
 NORI_COMMAND = re.compile(r"^/nori(?:@([a-z0-9_]+))?(?=\s|$)\s*(.*)$", re.IGNORECASE | re.DOTALL)
-HISTORY_MESSAGES = 50
-SUMMARY_BATCH = 15
+HISTORY_MESSAGES = 100
 SUMMARY_TIMEOUT = 10
 SUMMARY_PROMPT = (
     "Кратко обнови пересказ разговора: не более 200 слов. Сохрани имена участников, "
@@ -199,9 +198,8 @@ class ChatBot:
 
     async def remember(self, chat_id: int, memory: ChatMemory, *messages: dict[str, str]):
         updated = ChatMemory(deque([*memory.recent, *messages]), memory.summary)
-        oldest = []
-        if len(updated.recent) > HISTORY_MESSAGES:
-            oldest = [updated.recent.popleft() for _ in range(SUMMARY_BATCH)]
+        overflow = max(0, len(updated.recent) - HISTORY_MESSAGES)
+        oldest = [updated.recent.popleft() for _ in range(overflow)]
         self.store.save(chat_id, updated)
         memory.recent = updated.recent
         if not oldest:

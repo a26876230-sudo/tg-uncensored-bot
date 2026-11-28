@@ -215,7 +215,7 @@ def test_replies_include_quote_from_other_group_member(dispatch):
 
 
 @pytest.mark.parametrize("second_summary_fails", [False, True])
-def test_group_memory_summarizes_in_batches_without_losing_recent_text(dispatch, second_summary_fails):
+def test_group_memory_summarizes_only_entries_older_than_the_latest_100(dispatch, second_summary_fails):
     summaries = []
 
     def model_api(request):
@@ -232,18 +232,21 @@ def test_group_memory_summarizes_in_batches_without_losing_recent_text(dispatch,
         assert messages[1]["role"] == "system"
         assert messages[1]["content"].endswith(f'"пересказ {expected_number}"')
         assert messages[2:-1] == [
-            {"role": "user", "content": f"Owner: запись {i}"} for i in range(30, 66)
+            {"role": "user", "content": f"Owner: запись {i}"} for i in range(2, 102)
         ]
         assert messages[-1]["content"] == "Owner: Нори, что я говорил?"
         return completion("ответ")
 
-    messages = [make_message(f"запись {i}", -1, "group") for i in range(66)]
+    messages = [make_message(f"запись {i}", -1, "group") for i in range(102)]
     assert dispatch(model_api, [*messages, make_message("Нори, что я говорил?", -1, "group")]) == [(-1, "ответ")]
-    for index, summary in enumerate(summaries):
-        assert summary == {
-            "previous_summary": "" if index == 0 else "пересказ 1",
-            "messages": [{"role": "user", "content": f"Owner: запись {i}"} for i in range(index * 15, (index + 1) * 15)],
-        }
+    assert summaries == [
+        {"previous_summary": previous, "messages": [
+            {"role": "user", "content": f"Owner: запись {i}"} for i in indices
+        ]}
+        for previous, indices in (
+            ("", [0]), ("пересказ 1", [1]), ("пересказ 1" if second_summary_fails else "пересказ 2", [2, 3]),
+        )
+    ]
 
 
 def test_failed_sqlite_write_preserves_history_for_next_summary(tmp_path):
@@ -261,7 +264,7 @@ def test_failed_sqlite_write_preserves_history_for_next_summary(tmp_path):
             chatbot = ChatBot(config, http)
             try:
                 memory = ChatMemory()
-                entries = [{"role": "user", "content": f"запись {i}"} for i in range(51)]
+                entries = [{"role": "user", "content": f"запись {i}"} for i in range(101)]
                 for entry in entries[:-1]:
                     await chatbot.remember(-1, memory, entry)
                 db = chatbot.store.db
@@ -277,8 +280,8 @@ def test_failed_sqlite_write_preserves_history_for_next_summary(tmp_path):
 
                 db.execute("DROP TRIGGER fail_write")
                 await chatbot.remember(-1, memory, entries[-1])
-                assert summaries == [entries[:15]]
-                assert list(memory.recent) == entries[15:]
+                assert summaries == [entries[:1]]
+                assert list(memory.recent) == entries[1:]
                 assert memory.summary == "пересказ"
                 assert chatbot.store.load()[-1] == memory
             finally:
@@ -291,16 +294,20 @@ def test_recreated_bot_loads_recent_messages_and_summary_for_the_same_chat(dispa
     def summary_api(request):
         payload = json.loads(request.content)["messages"]
         assert payload[0]["content"] == SUMMARY_PROMPT
+        assert json.loads(payload[1]["content"])["messages"] == [{"role": "user", "content": "Owner: запись 0"}]
         return completion("Старые записи")
 
-    messages = [make_message(f"запись {i}", -1, "group") for i in range(51)]
+    messages = [make_message(f"запись {i}", -1, "group") for i in range(101)]
     messages.append(make_message("другой разговор", -2, "group"))
     assert dispatch(summary_api, messages) == []
 
     prompts = []
 
     def reply_api(request):
-        prompts.append(json.loads(request.content)["messages"])
+        messages = json.loads(request.content)["messages"]
+        if messages[0]["content"] == SUMMARY_PROMPT:
+            return completion("Обновлённый пересказ")
+        prompts.append(messages)
         return completion("помню")
 
     assert dispatch(reply_api, [
@@ -309,7 +316,7 @@ def test_recreated_bot_loads_recent_messages_and_summary_for_the_same_chat(dispa
     ]) == [(-1, "помню"), (-2, "помню")]
     assert prompts[0][1]["role"] == "system"
     assert prompts[0][1]["content"].endswith('"Старые записи"')
-    assert prompts[0][2:-1] == [{"role": "user", "content": f"Owner: запись {i}"} for i in range(15, 51)]
+    assert prompts[0][2:-1] == [{"role": "user", "content": f"Owner: запись {i}"} for i in range(1, 101)]
     assert prompts[1][1:-1] == [{"role": "user", "content": "Owner: другой разговор"}]
 
 
