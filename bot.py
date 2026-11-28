@@ -9,13 +9,14 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
 from groq import AsyncGroq
 from telegram import LinkPreviewOptions, Message, Update
-from telegram.constants import ChatAction, ChatType, MessageEntityType
+from telegram.constants import ChatAction, ChatType, MessageEntityType, StickerType
 from telegram.error import TelegramError
 from telegram.ext import Application, ContextTypes, Defaults, MessageHandler, filters
 
@@ -68,6 +69,26 @@ KEENABLE_SEARCH_URL = "https://api.keenable.ai/v1/search"
 SEARCH_TIMEOUT = 4
 SEARCH_LIMIT = 5
 TYPING_INTERVAL = 4
+BUBBLE_LIMIT = 280
+MAX_BUBBLES = 3
+DEFAULT_STICKER_SET = "Pusheen"
+REACTIONS = ("👍", "❤️", "🔥", "😂", "👏", "🎉")
+STICKER_MOODS = {
+    "laugh": ("😂", "😹", "😆", "🤣", "😄"),
+    "love": ("❤️", "😻", "😍", "💖", "💕"),
+    "celebrate": ("🎉", "🥳", "🎈", "🎂"),
+}
+FENCED_CODE = (
+    r"^ {0,3}(?P<fence>(?P<fence_char>[`~])(?P=fence_char){2,})[^\n]*\n"
+    r"[\s\S]*?(?:(?P<closing_fence>^ {0,3}(?P=fence)(?P=fence_char)*[ \t]*(?=\r?$))|\Z)"
+)
+REPLY_CODE = re.compile(
+    FENCED_CODE + r"|(?<!`)(?P<ticks>`+)(?!`)[\s\S]*?(?<!`)(?P=ticks)(?!`)", re.MULTILINE,
+)
+REPLY_MARKER = re.compile(
+    r"(?<![\w\[\\])\[+[ \t]*(?:(next)[ \t]*|(reaction|sticker)[ \t]*(?:[:=][ \t]*([^\]\r\n]*))?)"
+    r"(\]+(?!\w)|(?=\r?$))", re.IGNORECASE | re.MULTILINE,
+)
 CHATTER = {
     "", "привет", "приветик", "здравствуй", "здорово", "доброе утро", "добрый день",
     "добрый вечер", "спасибо", "благодарю", "как дела", "привет как дела", "пока", "спокойной ночи",
@@ -79,11 +100,16 @@ SEARCH_NOTE = (
 )
 
 
-SYSTEM_PROMPT = """Ты живой собеседник в Телеграме, а не вежливый ассистент. Говоришь просто, по-человечески, на «ты», можешь материться, если собеседник сам так общается. Без нравоучений, без «как ИИ я не могу», без дисклеймеров и предупреждений в каждом ответе.
+SYSTEM_PROMPT = f"""Ты живой собеседник в Телеграме, а не вежливый ассистент. Говоришь просто, по-человечески, на «ты», можешь материться, если собеседник сам так общается. Без нравоучений, без «как ИИ я не могу», без дисклеймеров и предупреждений в каждом ответе.
 
 Отвечаешь прямо и по делу на любые вопросы, включая те, от которых обычные нейронки уходят: взрослые темы, мрачный юмор, политика, религия, наркотики и их эффекты, серые схемы, хакинг для изучения и защиты, жёсткие мнения. Если спросили твоё мнение, говоришь его, а не «есть разные точки зрения». Если нашёл что-то в поиске, опирайся на источники, но ссылки в чат не отправляй.
 
 Тон зеркалишь: с вежливым вежлив, с шутником шутишь, на грубость отвечаешь грубо и с юмором, но без угроз и без оскорблений по нации, расе, религии, полу и ориентации.
+
+Пиши как в личной переписке, без вступлений и канцелярита. Начни с ответа или результата. Обычно хватит одного сообщения из одного-двух коротких предложений. Второе отправляй только для отдельной мысли или уточнения: поставь отдельный [next] между сообщениями, не внутри кода. В крайнем случае три сообщения, каждое до 280 знаков, кроме блока кода. Используй обычные заглавные и знаки препинания, подстраивайся под собеседника. Эмодзи — только если он помогает передать тон или смысл.
+Если слов действительно не надо (например, в ответ на благодарность или шутку), выведи только [reaction:ЭМОДЗИ], выбрав один эмодзи из {' '.join(REACTIONS)}.
+Если вместо слов к месту стикер, начни с [sticker:НАСТРОЕНИЕ], выбрав laugh (смех), love (умиление) или celebrate (праздник). После маркера напиши короткую реплику на случай, если стикер недоступен.
+Не заменяй реакцией или стикером содержательный ответ на вопрос или просьбу.
 
 Жёсткие границы, тут отказываешь коротко, одной фразой, без лекций, и идёшь дальше:
 1. Любой сексуальный контент с участием несовершеннолетних, в любой форме, даже «для истории».
@@ -181,6 +207,7 @@ class Config:
     db_path: Path = DEFAULT_DB_PATH
     groq_key: str = ""
     vision_model: str = VISION_MODEL
+    sticker_set: str = DEFAULT_STICKER_SET
 
     @classmethod
     def from_env(cls):
@@ -201,7 +228,8 @@ class Config:
         db_path = Path(os.environ.get("CHAT_BOT_DB", "").strip() or DEFAULT_DB_PATH).expanduser()
         groq_key = os.environ.get("GROQ_API_KEY", "").strip()
         vision_model = os.environ.get("CHAT_BOT_VISION_MODEL", "").strip() or VISION_MODEL
-        return cls(token, api_key, model, search_enabled, keenable_key, name, db_path, groq_key, vision_model)
+        sticker_set = os.environ.get("CHAT_BOT_STICKER_SET", DEFAULT_STICKER_SET).strip()
+        return cls(token, api_key, model, search_enabled, keenable_key, name, db_path, groq_key, vision_model, sticker_set)
 
 
 @dataclass
@@ -210,6 +238,81 @@ class ChatMemory:
     summary: str = ""
     messages_since_reply: int = 0
     next_chime_at: float = 0
+
+
+@dataclass(frozen=True)
+class TelegramReply:
+    bubbles: tuple[str, ...]
+    reaction: str | None = None
+    sticker_mood: str | None = None
+
+
+def prose_chunks(text: str):
+    for block in re.split(r"\n\s*\n", text):
+        block = block.strip()
+        while len(block) > BUBBLE_LIMIT:
+            window = block[:BUBBLE_LIMIT + 1]
+            sentences = list(re.finditer(r"[.!?…](?=\s)", window))
+            spaces = list(re.finditer(r"\s+", window))
+            if sentences and sentences[-1].end() >= BUBBLE_LIMIT // 2:
+                cut = sentences[-1].end()
+            else:
+                cut = spaces[-1].start() if spaces else BUBBLE_LIMIT
+            yield block[:cut].rstrip()
+            block = block[cut:].lstrip()
+        if block:
+            yield block
+
+
+def bubble_chunks(text: str):
+    start = 0
+    for code in REPLY_CODE.finditer(text):
+        if code["fence"] is None:
+            continue
+        prose = list(prose_chunks(text[start:code.start()]))
+        block = code[0]
+        if prose:
+            with_intro = f"{prose[-1]}\n\n{block}"
+            if next(split_text(with_intro)) == with_intro:
+                prose.pop()
+                block = with_intro
+        yield from ((part, False) for part in prose)
+        yield from ((part, True) for part in split_text(block))
+        start = code.end()
+    yield from ((part, False) for part in prose_chunks(text[start:]))
+
+
+def parse_reply(answer: str) -> TelegramReply:
+    markers = []
+    pieces = []
+    start = 0
+    for code in REPLY_CODE.finditer(answer):
+        prose = answer[start:code.start()]
+        markers.extend((start + match.start(), match) for match in REPLY_MARKER.finditer(prose))
+        pieces.extend((REPLY_MARKER.sub(lambda match: "\n\n" if match[1] else "", prose), code[0]))
+        start = code.end()
+    prose = answer[start:]
+    markers.extend((start + match.start(), match) for match in REPLY_MARKER.finditer(prose))
+    pieces.append(REPLY_MARKER.sub(lambda match: "\n\n" if match[1] else "", prose))
+    first = markers[0][1] if len(markers) == 1 and not answer[:markers[0][0]].strip() else None
+    text = "".join(pieces)
+    chunks = list(islice(bubble_chunks(text), MAX_BUBBLES + 1))
+    bubbles = [part for part, _ in chunks[:MAX_BUBBLES]]
+    if len(chunks) > MAX_BUBBLES and not chunks[MAX_BUBBLES - 1][1]:
+        bubbles[-1] = bubbles[-1][:BUBBLE_LIMIT - 1].rstrip(" …") + "…"
+    if first and first[2] and first[3] and first[4]:
+        kind, value = first[2].lower(), first[3].strip()
+        if kind == "reaction" and not bubbles:
+            reaction = next((emoji for emoji in REACTIONS if emoji.rstrip("\ufe0f") == value.rstrip("\ufe0f")), None)
+            if reaction:
+                return TelegramReply((reaction,), reaction=reaction)
+        if kind == "sticker" and value.lower() in STICKER_MOODS:
+            return TelegramReply(tuple(bubbles) or (STICKER_MOODS[value.lower()][0],), sticker_mood=value.lower())
+    return TelegramReply(tuple(bubbles) or ("Не знаю, что сказать.",))
+
+
+async def pause_before_bubble(text: str):
+    await asyncio.sleep(min(2.6, 0.4 + len(text) * 0.015))
 
 
 class MemoryStore:
@@ -303,6 +406,7 @@ class ChatBot:
         self.memories = self.store.load()
         self.next_chime_at = 0.0
         self.quota_cooldown_until = 0.0
+        self.sticker_ids: dict[str, str] | None = None
 
     def should_chime_in(self, memory: ChatMemory, text: str) -> bool:
         now = time.monotonic()
@@ -319,6 +423,45 @@ class ChatBot:
         memory.next_chime_at = now + CHIME_CHAT_COOLDOWN
         self.next_chime_at = now + CHIME_GLOBAL_COOLDOWN
         return True
+
+    async def send_sticker(self, message: Message, mood: str) -> str | None:
+        if not self.config.sticker_set:
+            return None
+        try:
+            if self.sticker_ids is None:
+                sticker_set = await message.get_bot().get_sticker_set(self.config.sticker_set)
+                by_emoji = {
+                    sticker.emoji.replace("\ufe0f", ""): sticker.file_id
+                    for sticker in sticker_set.stickers if sticker.emoji
+                } if sticker_set.sticker_type == StickerType.REGULAR else {}
+                self.sticker_ids = {}
+                for name, emojis in STICKER_MOODS.items():
+                    for emoji in emojis:
+                        if file_id := by_emoji.get(emoji.replace("\ufe0f", "")):
+                            self.sticker_ids[name] = file_id
+                            break
+            if file_id := self.sticker_ids.get(mood):
+                sent = await message.reply_sticker(file_id)
+                emoji = sent.sticker.emoji if sent.sticker else None
+                return f"Отправила стикер {emoji}" if emoji else "Отправила стикер"
+        except TelegramError as exc:
+            LOG.warning("Не удалось отправить стикер: %s", type(exc).__name__)
+        return None
+
+    async def send_reply(self, message: Message, reply: TelegramReply) -> str:
+        if reply.reaction:
+            try:
+                if await message.set_reaction(reply.reaction):
+                    return f"Поставила реакцию {reply.reaction}"
+            except TelegramError as exc:
+                LOG.warning("Не удалось поставить реакцию: %s", type(exc).__name__)
+        if reply.sticker_mood and (sent := await self.send_sticker(message, reply.sticker_mood)):
+            return sent
+        for bubble in reply.bubbles:
+            async with show_typing(message):
+                await pause_before_bubble(bubble)
+            await message.reply_text(bubble)
+        return "\n\n".join(reply.bubbles)
 
     def needs_search(self, query: str, username: str) -> bool:
         query = re.sub(rf"(?<!\w)@{re.escape(username.casefold())}(?!\w)", " ", query.casefold())
@@ -384,10 +527,19 @@ class ChatBot:
             answer = None
         if not isinstance(answer, str) or not answer.strip():
             raise ValueError("Пустой или некорректный ответ UnleashedAPI.")
-        answer = answer.strip()
         if mark_truncated and choice.get("finish_reason") == "length":
-            answer += " …"
-        return answer
+            last_code = None
+            for last_code in REPLY_CODE.finditer(answer):
+                pass
+            if last_code and last_code["fence"] and not answer[last_code.end():].strip():
+                if last_code["closing_fence"] is None:
+                    if not answer.endswith("\n"):
+                        answer += "\n"
+                    answer += last_code["fence"]
+                answer += "\n\n…"
+            else:
+                answer = answer.rstrip() + " …"
+        return answer if mark_truncated else answer.strip()
 
     async def classify_message(
         self, latest: dict[str, str], *, answer: str | None = None, skip_if_busy: bool = False,
@@ -420,11 +572,13 @@ class ChatBot:
 
     async def complete(
         self, memory: ChatMemory, latest: dict[str, str], sources: list[dict[str, str]], *, reasoning: bool = False,
-        people: list[dict[str, str]] | None = None, spontaneous: bool = False,
+        people: list[dict[str, str]] | None = None, spontaneous: bool = False, speak: bool = False,
     ) -> str:
         system_prompt = f"{SYSTEM_PROMPT}\nТебя зовут {self.config.name}."
         if spontaneous:
             system_prompt += f"\n{CHIME_PROMPT}"
+        if speak:
+            system_prompt += "\nЭтот ответ будет озвучен. Пиши обычный текст без маркеров, реакций и стикеров."
         if sources:
             system_prompt += f"\n{SEARCH_NOTE}"
             results = json.dumps(sources, ensure_ascii=False)
@@ -458,7 +612,7 @@ class ChatBot:
 
     async def generate_reply(
         self, memory: ChatMemory, latest: dict[str, str], query: str, username: str, quote: str | None, *,
-        people: list[dict[str, str]], spontaneous: bool, has_media: bool,
+        people: list[dict[str, str]], spontaneous: bool, has_media: bool, speak: bool,
     ) -> str | None:
         text = (f"{query}\n{quote}" if quote else query).casefold()
         if spontaneous or has_media or matches_signal_groups(text, BOUNDARY_SIGNALS):
@@ -474,6 +628,7 @@ class ChatBot:
         sources = await self.search(query) if not (has_media or spontaneous) and self.needs_search(query, username) else []
         answer = await self.complete(
             memory, latest, sources, reasoning=reasoning and not spontaneous, people=people, spontaneous=spontaneous,
+            speak=speak,
         )
         output = answer.casefold()
         if (has_media or matches_signal_groups(output, BOUNDARY_SIGNALS)
@@ -625,7 +780,7 @@ class ChatBot:
                 people = self.store.people(chat_id, user.id if user else None)
                 answer = await self.generate_reply(
                     memory, latest, query, context.bot.username, quote, people=people, spontaneous=spontaneous,
-                    has_media=media is not None,
+                    has_media=media is not None, speak=speak,
                 )
         except MediaError as exc:
             await message.reply_text(str(exc))
@@ -654,11 +809,14 @@ class ChatBot:
                     await message.reply_text(BOUNDARY_OVERLOAD)
                     memory.messages_since_reply = 0
                 return
-            if not (speak and answer != BOUNDARY_REFUSAL and await self.speech.try_reply(message, answer)):
-                for part in split_text(answer):
-                    await message.reply_text(part)
+            reply = parse_reply(answer)
+            spoken = "\n\n".join(reply.bubbles)
+            if speak and not reply.reaction and answer != BOUNDARY_REFUSAL and await self.speech.try_reply(message, spoken):
+                sent = spoken
+            else:
+                sent = await self.send_reply(message, TelegramReply(reply.bubbles) if speak else reply)
             memory.messages_since_reply = 0
-            saved = [remembered, {"role": "assistant", "content": answer}]
+            saved = [remembered, {"role": "assistant", "content": sent}]
         finally:
             if saved:
                 await self.remember(chat_id, memory, *saved)
