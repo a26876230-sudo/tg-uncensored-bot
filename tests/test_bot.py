@@ -6,7 +6,7 @@ import pytest
 from telegram import Update
 from telegram.request import HTTPXRequest
 
-from bot import DEFAULT_MODEL, SEARCH_NOTE, SYSTEM_PROMPT, Config, build_application
+from bot import DEFAULT_BOT_NAME, DEFAULT_MODEL, SEARCH_NOTE, SUMMARY_PROMPT, SYSTEM_PROMPT, Config, build_application
 
 
 BOT = {"id": 123, "is_bot": True, "first_name": "Chat", "username": "chat_bot"}
@@ -38,9 +38,9 @@ def dispatch(monkeypatch):
 
     monkeypatch.setattr(HTTPXRequest, "do_request", telegram_api)
 
-    def run(model_api, messages, model=DEFAULT_MODEL, *, search_enabled=False, keenable_key=""):
+    def run(model_api, messages, model=DEFAULT_MODEL, *, search_enabled=False, keenable_key="", name=DEFAULT_BOT_NAME):
         async def process():
-            config = Config("123:fake", "ulk-fake", model, search_enabled, keenable_key)
+            config = Config("123:fake", "ulk-fake", model, search_enabled, keenable_key, name)
             application = build_application(config, httpx.MockTransport(model_api))
             async with application:
                 for index, message in enumerate(messages):
@@ -63,6 +63,7 @@ def test_config_uses_only_chat_token_and_allows_model_override(monkeypatch):
     monkeypatch.delenv("UNLEASHED_MODEL", raising=False)
     monkeypatch.delenv("KEENABLE_SEARCH_ENABLED", raising=False)
     monkeypatch.delenv("KEENABLE_API_KEY", raising=False)
+    monkeypatch.delenv("CHAT_BOT_NAME", raising=False)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:bridge")
     monkeypatch.setenv("UNLEASHED_API_KEY", "ulk-fake")
     with pytest.raises(ValueError, match="CHAT_BOT_TOKEN"):
@@ -74,6 +75,8 @@ def test_config_uses_only_chat_token_and_allows_model_override(monkeypatch):
     assert Config.from_env() == Config("123:chat", "ulk-fake", DEFAULT_MODEL)
     monkeypatch.setenv("UNLEASHED_MODEL", "other-model")
     assert Config.from_env().model == "other-model"
+    monkeypatch.setenv("CHAT_BOT_NAME", " Луна ")
+    assert Config.from_env().name == "Луна"
 
 
 def test_search_settings_from_env(monkeypatch):
@@ -96,7 +99,7 @@ def test_dispatches_only_private_or_addressed_group_messages(dispatch):
         assert request.headers["Authorization"] == "Bearer ulk-fake"
         payload = json.loads(request.content)
         assert payload["model"] == "selected-model"
-        assert payload["messages"][0] == {"role": "system", "content": SYSTEM_PROMPT}
+        assert payload["messages"][0] == {"role": "system", "content": f"{SYSTEM_PROMPT}\nТебя зовут Нори."}
         prompts.append(payload["messages"][1:])
         return completion("ответ")
 
@@ -114,13 +117,17 @@ def test_dispatches_only_private_or_addressed_group_messages(dispatch):
     answer = {"role": "assistant", "content": "ответ"}
     assert prompts == [
         [{"role": "user", "content": "привет приватно"}],
-        [{"role": "user", "content": mention}],
-        [{"role": "user", "content": mention}, answer, {"role": "user", "content": "ответ боту"}],
+        [{"role": "user", "content": "Owner: я пишу всем"}, {"role": "user", "content": f"Owner: {mention}"}],
+        [
+            {"role": "user", "content": "Owner: я пишу всем"},
+            {"role": "user", "content": f"Owner: {mention}"}, answer,
+            {"role": "user", "content": "Owner: ответ боту\n\nЦитата из сообщения, на которое отвечают:\nответ"},
+        ],
         [{"role": "user", "content": "привет приватно"}, answer, {"role": "user", "content": "ещё приватно"}],
     ]
 
 
-def test_caps_history_and_splits_reply_at_telegram_limit(dispatch):
+def test_splits_reply_at_telegram_limit(dispatch):
     prompts = []
     long_reply = "🙂" * 2049
 
@@ -131,7 +138,7 @@ def test_caps_history_and_splits_reply_at_telegram_limit(dispatch):
     replies = dispatch(model_api, [make_message(f"запрос {i}") for i in range(8)])
     assert replies[-2:] == [(456, "🙂" * 2048), (456, "🙂")]
     assert [message["content"] for message in prompts[-1] if message["role"] == "user"] == [
-        f"запрос {i}" for i in range(1, 8)
+        f"запрос {i}" for i in range(8)
     ]
 
 
@@ -153,7 +160,77 @@ def test_accepts_anonymous_admin_but_ignores_a_bot(dispatch):
         ),
     ]
     assert dispatch(model_api, messages) == [(group["id"], "ответ")]
-    assert prompts == ["@chat_bot админ"]
+    assert prompts == ["Группа: @chat_bot админ"]
+
+
+def test_name_and_command_trigger_search_only_when_addressed(dispatch):
+    searches = []
+
+    def api(request):
+        payload = json.loads(request.content)
+        if request.url.host == "api.keenable.ai":
+            searches.append(payload["query"])
+            return httpx.Response(200, json={"results": []})
+        assert payload["messages"][0]["content"].endswith("Тебя зовут Луна.")
+        return completion("ответ")
+
+    messages = [make_message(text, -1, "group") for text in [
+        "Нори, привет", "лунатики и полуна", "Это _луна_ и Луна2", "/nori@other_bot не нам",
+        "Ты согласна, ЛУНА?", "луна", "/nori первый вопрос", "/nori@CHAT_BOT второй вопрос",
+        "/nori",
+    ]]
+    assert dispatch(api, messages, search_enabled=True, name="Луна") == [
+        (-1, "ответ"), (-1, "ответ"), (-1, "ответ"), (-1, "ответ"), (-1, "Напишите сообщение текстом."),
+    ]
+    assert searches == ["Ты согласна, ЛУНА?", "луна", "первый вопрос", "второй вопрос"]
+
+
+def test_replies_include_quote_from_other_group_member(dispatch):
+    def model_api(request):
+        messages = json.loads(request.content)["messages"]
+        assert messages[-1] == {
+            "role": "user", "content": "Owner: объясни\n\nЦитата из сообщения, на которое отвечают:\nТолько фрагмент",
+        }
+        return completion("ответ")
+
+    original = make_message("Только фрагмент, а не всё.", -1, "group")
+    message = make_message(
+        "/nori объясни", -1, "group", reply_to_message=original,
+        quote={"text": "Только фрагмент", "position": 0},
+    )
+    assert dispatch(model_api, [message]) == [(-1, "ответ")]
+
+
+@pytest.mark.parametrize("second_summary_fails", [False, True])
+def test_group_memory_summarizes_in_batches_without_losing_recent_text(dispatch, second_summary_fails):
+    summaries = []
+
+    def model_api(request):
+        payload = json.loads(request.content)
+        messages = payload["messages"]
+        if messages[0]["content"] == SUMMARY_PROMPT:
+            summaries.append(json.loads(messages[1]["content"]))
+            assert payload["max_tokens"] == 500
+            if len(summaries) == 2 and second_summary_fails:
+                return httpx.Response(503)
+            return completion(f"пересказ {len(summaries)}")
+        assert len(summaries) == 2
+        expected_number = 1 if second_summary_fails else 2
+        assert messages[1]["role"] == "system"
+        assert messages[1]["content"].endswith(f'"пересказ {expected_number}"')
+        assert messages[2:-1] == [
+            {"role": "user", "content": f"Owner: запись {i}"} for i in range(30, 66)
+        ]
+        assert messages[-1]["content"] == "Owner: Нори, что я говорил?"
+        return completion("ответ")
+
+    messages = [make_message(f"запись {i}", -1, "group") for i in range(66)]
+    assert dispatch(model_api, [*messages, make_message("Нори, что я говорил?", -1, "group")]) == [(-1, "ответ")]
+    for index, summary in enumerate(summaries):
+        assert summary == {
+            "previous_summary": "" if index == 0 else "пересказ 1",
+            "messages": [{"role": "user", "content": f"Owner: запись {i}"} for i in range(index * 15, (index + 1) * 15)],
+        }
 
 
 @pytest.mark.parametrize("key", ["", "keen-fake"])
@@ -210,7 +287,7 @@ def test_search_failures_still_answer_without_sources(dispatch, failure):
                 return httpx.Response(200, text="not JSON")
             return httpx.Response(failure)
         assert json.loads(request.content)["messages"] == [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": f"{SYSTEM_PROMPT}\nТебя зовут Нори."},
             {"role": "user", "content": "вопрос"},
         ]
         return completion("ответ без поиска")
