@@ -273,7 +273,8 @@ class ChatBot:
         if quote:
             content += f"\n\nЦитата из сообщения, на которое отвечают:\n{quote}"
         latest = {"role": "user", "content": content}
-        saved = [original] if group else []
+        remembered = latest if quote else original
+        saved = [remembered] if group else []
         try:
             sources = await self.search(query)
             answer = await self.complete(memory, latest, sources)
@@ -290,7 +291,7 @@ class ChatBot:
         else:
             for part in split_text(answer):
                 await message.reply_text(part)
-            saved = [original, {"role": "assistant", "content": answer}]
+            saved = [remembered, {"role": "assistant", "content": answer}]
         finally:
             if saved:
                 await self.remember(chat_id, memory, *saved)

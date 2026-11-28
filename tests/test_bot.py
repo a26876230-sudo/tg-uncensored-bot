@@ -190,11 +190,11 @@ def test_name_and_command_trigger_search_only_when_addressed(dispatch):
 
 
 def test_replies_include_quote_from_other_group_member(dispatch):
+    prompts = []
+
     def model_api(request):
         messages = json.loads(request.content)["messages"]
-        assert messages[-1] == {
-            "role": "user", "content": "Owner: объясни\n\nЦитата из сообщения, на которое отвечают:\nТолько фрагмент",
-        }
+        prompts.append(messages[1:])
         return completion("ответ")
 
     original = make_message("Только фрагмент, а не всё.", -1, "group")
@@ -203,6 +203,11 @@ def test_replies_include_quote_from_other_group_member(dispatch):
         quote={"text": "Только фрагмент", "position": 0},
     )
     assert dispatch(model_api, [message]) == [(-1, "ответ")]
+    assert dispatch(model_api, [make_message("Нори, а подробнее?", -1, "group")]) == [(-1, "ответ")]
+    assert prompts[0][-1] == {
+        "role": "user", "content": "Owner: объясни\n\nЦитата из сообщения, на которое отвечают:\nТолько фрагмент",
+    }
+    assert prompts[1][:-1] == [prompts[0][-1], {"role": "assistant", "content": "ответ"}]
 
 
 @pytest.mark.parametrize("second_summary_fails", [False, True])
