@@ -1013,6 +1013,28 @@ def test_people_memory_does_not_attribute_forwarded_or_quoted_facts_to_sender(di
     ]) == [(-1, "помню")]
 
 
+@pytest.mark.parametrize("question", [
+    "Нори, люблю ли я рок?",
+    "Люблю рок?",
+    "Люблю ли я рок",
+    "Меня зовут Маша, да?",
+    "Работаю поваром?",
+])
+def test_people_memory_questions_do_not_overwrite_facts(dispatch, question):
+    def model_api(request):
+        messages = json.loads(request.content)["messages"]
+        notes = next(msg["content"] for msg in messages if msg["content"].startswith("Заметки об участниках"))
+        person, = json.loads(notes.split("\n", 1)[1])
+        assert (person["имя"], person["занятие"], person["интересы"]) == ("Лена", "врачом", "джаз")
+        return completion("помню")
+
+    assert dispatch(model_api, [
+        make_message("Меня зовут Лена. Работаю врачом. Люблю джаз.", -1, "group"),
+        make_message(question, -1, "group"),
+        make_message("Нори, вспомни", -1, "group"),
+    ])[-1:] == [(-1, "помню")]
+
+
 CHIME_TEXT = "Этот новый фильм про далёкий космос мне определённо понравился!"
 
 

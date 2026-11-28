@@ -36,8 +36,8 @@ PROFILE_TOTAL_LIMIT = 4096
 PROFILE_PROMPT_LIMIT = 8
 PROFILE_FACTS = {
     "имя": r"меня зовут\s+([^\W\d_]+(?:[- ][^\W\d_]+){0,2})\s*(?=[,.!?;]|$)",
-    "занятие": r"(?:я\s+)?(?:работаю|учусь|занимаюсь)\s+([^.!?;\n]{1,100})(?=[.!?;\n]|$)",
-    "интересы": r"(?:я\s+)?(?:люблю|увлекаюсь|интересуюсь)\s+([^.!?;\n]{1,100})(?=[.!?;\n]|$)",
+    "занятие": r"(?:я\s+)?(?:работаю|учусь|занимаюсь)(?!\s+ли\b)\s+([^.!?;\n]{1,100})(?=[.!;]|$)",
+    "интересы": r"(?:я\s+)?(?:люблю|увлекаюсь|интересуюсь)(?!\s+ли\b)\s+([^.!?;\n]{1,100})(?=[.!;]|$)",
 }
 PROFILE_QUOTE_TYPES = {MessageEntityType.BLOCKQUOTE, MessageEntityType.EXPANDABLE_BLOCKQUOTE}
 CHIME_MIN_MESSAGES = 20
@@ -248,10 +248,13 @@ class MemoryStore:
 
     def remember_person(self, chat_id: int, user_id: int, name: str, text: str):
         facts = {}
-        for field, pattern in PROFILE_FACTS.items():
-            match = re.search(rf"(?:^|[.!?;]\s+|\n\s*){pattern}", text, re.IGNORECASE)
-            if match and (value := match[1].strip()):
-                facts[field] = value[:100]
+        for sentence in re.findall(r"[^.!?;\n]+[.!?;]?", text):
+            if sentence.endswith("?"):
+                continue
+            for field, pattern in PROFILE_FACTS.items():
+                match = re.match(pattern, sentence.lstrip(), re.IGNORECASE)
+                if match and (value := match[1].strip()):
+                    facts.setdefault(field, value[:100])
         if not facts:
             return
         with self.db:
