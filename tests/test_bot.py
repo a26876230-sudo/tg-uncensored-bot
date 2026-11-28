@@ -30,6 +30,7 @@ def dispatch(monkeypatch, tmp_path):
             result = BOT
         elif endpoint == "sendMessage":
             params = request_data.parameters
+            assert params["link_preview_options"] == {"is_disabled": True}
             sent.append((params["chat_id"], params["text"]))
             result = make_message(params["text"], params["chat_id"], **{"from": BOT})
         else:
@@ -304,6 +305,22 @@ def test_search_sources_reach_model_but_do_not_enter_history(dispatch, key):
         ("search", "курс биткоина"), ("complete", "курс биткоина"),
         ("search", "ещё вопрос"), ("complete", "ещё вопрос"),
     ]
+
+
+def test_model_reply_does_not_get_a_sources_block_or_link_preview(dispatch):
+    source = {"title": "Источник", "url": "https://example.com/source", "snippet": "выдержка"}
+    text = "Ответ модели с просочившейся ссылкой https://example.net/leak"
+
+    def api(request):
+        if request.url.host == "api.keenable.ai":
+            return httpx.Response(200, json={"results": [source]})
+        messages = json.loads(request.content)["messages"]
+        assert "ссылки в чат не отправляй" in messages[0]["content"]
+        assert "не отправляй ссылки и списки источников" in messages[0]["content"]
+        assert source["url"] in messages[-1]["content"]
+        return completion(text)
+
+    assert dispatch(api, [make_message("вопрос")], search_enabled=True) == [(456, text)]
 
 
 @pytest.mark.parametrize("failure", [429, "timeout", "invalid JSON"])
